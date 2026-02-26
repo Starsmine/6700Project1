@@ -1,0 +1,3932 @@
+`timescale 1ps / 1ps
+
+// =========================================================================
+// Debug Control
+// =========================================================================
+// To DISABLE verbose debug messages:
+//   Comment out the line below (add // in front)
+//   You'll still see: State transitions, TEST results, Errors
+//
+// To ENABLE verbose debug messages:
+//   Uncomment the line below (remove //)
+//   You'll see: Per-cycle details, data captures, memory transactions
+// =========================================================================
+`define DEBUG_VERBOSE
+
+module cache_top_tb;
+
+    // =========================================================================
+    // Scoreboard Statistics
+    // =========================================================================
+    // Overall Test Tracking
+    int test_count;               // Total tests run
+    int test_passed;              // Tests passed
+    int test_failed;              // Tests failed
+    int prev_sb_fails;            // Scoreboard fails at start of current test
+    
+    // Cache Performance Metrics
+    int total_transactions;
+    int correct_predictions;
+    int incorrect_predictions;
+    int cache_hits_observed;
+    int cache_misses_observed;
+    
+    // Data Verification (only on read hits)
+    int read_transactions;        // Total read operations
+    int data_matches;             // Data correctness tracking
+    int data_mismatches;
+    
+    // Coherency Verification
+    int coherency_checks;         // Total coherency verifications
+    int coherency_passed;         // Coherency checks passed
+    int coherency_failed;         // Coherency checks failed
+
+//Internal signals declarations:
+reg clk;
+reg reset;
+
+// CPU0 side (testing only CPU0, others tied off)
+reg         cpu0_req;
+reg         cpu0_we;
+reg [31:0]  cpu0_addr;
+reg [31:0]  cpu0_wdata;
+wire [31:0] cpu0_rdata;
+wire        cpu0_ready;
+wire        cpu0_miss;
+
+// CPU1-3 tied off (not used in this test)
+reg         cpu1_req   = 0;
+reg         cpu1_we    = 0;
+reg [31:0]  cpu1_addr  = 0;
+reg [31:0]  cpu1_wdata = 0;
+wire [31:0] cpu1_rdata;
+wire        cpu1_ready;
+wire        cpu1_miss;
+
+reg         cpu2_req   = 0;
+reg         cpu2_we    = 0;
+reg [31:0]  cpu2_addr  = 0;
+reg [31:0]  cpu2_wdata = 0;
+wire [31:0] cpu2_rdata;
+wire        cpu2_ready;
+wire        cpu2_miss;
+
+reg         cpu3_req   = 0;
+reg         cpu3_we    = 0;
+reg [31:0]  cpu3_addr  = 0;
+reg [31:0]  cpu3_wdata = 0;
+wire [31:0] cpu3_rdata;
+wire        cpu3_ready;
+wire        cpu3_miss;
+
+// Memory side (32-bit blocking bus)
+wire        mem_valid;
+reg         mem_ready;
+wire        mem_we;
+wire [31:0] mem_addr;
+reg [31:0]  mem_rdata;
+
+
+
+// Device Under Test port map
+	Top DUT (
+		.clk(clk),
+		.reset(reset),
+		
+		// CPU0 - under test
+		.cpu0_req(cpu0_req),
+		.cpu0_we(cpu0_we),	
+		.cpu0_addr(cpu0_addr),
+		.cpu0_wdata(cpu0_wdata),
+		.cpu0_rdata(cpu0_rdata),
+		.cpu0_ready(cpu0_ready),
+		.cpu0_miss(cpu0_miss),
+		
+		// CPU1-3 - tied off
+		.cpu1_req(cpu1_req),
+		.cpu1_we(cpu1_we),	
+		.cpu1_addr(cpu1_addr),
+		.cpu1_wdata(cpu1_wdata),
+		.cpu1_rdata(cpu1_rdata),
+		.cpu1_ready(cpu1_ready),
+		.cpu1_miss(cpu1_miss),
+		
+		.cpu2_req(cpu2_req),
+		.cpu2_we(cpu2_we),	
+		.cpu2_addr(cpu2_addr),
+		.cpu2_wdata(cpu2_wdata),
+		.cpu2_rdata(cpu2_rdata),
+		.cpu2_ready(cpu2_ready),
+		.cpu2_miss(cpu2_miss),
+		
+		.cpu3_req(cpu3_req),
+		.cpu3_we(cpu3_we),	
+		.cpu3_addr(cpu3_addr),
+		.cpu3_wdata(cpu3_wdata),
+		.cpu3_rdata(cpu3_rdata),
+		.cpu3_ready(cpu3_ready),
+		.cpu3_miss(cpu3_miss),
+		
+		// Memory
+		.mem_valid(mem_valid),
+		.mem_ready(mem_ready),
+		.mem_we(mem_we),
+		.mem_addr(mem_addr),
+		.mem_rdata(mem_rdata));
+		
+		
+		// Clock generator
+    always #5 clk = ~clk;
+    
+    // =========================================================================
+    // Global Watchdog Timer - detect infinite loops
+    // =========================================================================
+    int watchdog_counter = 0;
+    localparam WATCHDOG_LIMIT = 100000;  // Max clock cycles before forced stop
+    always @(posedge clk) begin
+        if (reset)
+            watchdog_counter <= 0;
+        else begin
+            watchdog_counter <= watchdog_counter + 1;
+            if (watchdog_counter >= WATCHDOG_LIMIT) begin
+                $display("[WATCHDOG @%0t] TIMEOUT after %0d cycles! Forcing $finish.", $time, watchdog_counter);
+                $display("[WATCHDOG] mem_valid=%b, mem_ready=%b, mem_we=%b, mem_addr=%h, mem_cycle_count=%0d",
+                         mem_valid, mem_ready, mem_we, mem_addr, mem_cycle_count);
+                $finish;
+            end
+        end
+    end
+
+    // =========================================================================
+    // Memory Model - 32-bit blocking bus
+    // =========================================================================
+    // Updated from 128-bit to 32-bit sequential transfers
+    // Read transfers: 5 cycles (1 addr + 4 data words)
+    // Write-back transfers: 7 cycles (1 addr + 2 pipeline fill + 4 data words)
+    //   The 2 extra WB cycles account for the bus arbiter's registered mem_ready
+    //   return path (1 cycle) + L2 FSM state register (1 cycle)
+    // =========================================================================
+    
+    logic [31:0] memory [0:8191];  // 32KB memory (8K words)
+    
+    int mem_cycle_count = 0;
+    int mem_transaction_count = 0;  // Count of all main-memory transactions (reads + write-backs)
+    int mem_wb_count = 0;           // Count of write-back transactions only (L2->memory)
+    logic [31:0] mem_block_addr;
+    logic prev_mem_valid = 0;       // Track mem_valid edges for transaction restart
+    int mem_stuck_watchdog = 0;      // Watchdog: detect stuck memory transactions
+
+    always @(posedge clk) begin
+        if (reset) begin
+            mem_ready <= 0;
+            mem_cycle_count <= 0;
+            mem_rdata <= 32'hxxxxxxxx;
+            prev_mem_valid <= 0;
+        end else begin
+            prev_mem_valid <= mem_valid;
+            
+            if (mem_valid) begin
+                // Rising edge of mem_valid always starts a fresh transaction.
+                // Normally mem_cycle_count is already 0 here, but if a prior
+                // transaction's count wasn't properly reset (bus_valid stayed
+                // high across the arbiter grant boundary), force a restart.
+                if (mem_cycle_count == 0 || (mem_valid && !prev_mem_valid)) begin
+                    if (mem_cycle_count != 0) begin
+                        $display("[MEM @%0t] WARNING: Restarting transaction — count was %0d (stale from prior xfer)",
+                                 $time, mem_cycle_count);
+                    end
+                    mem_block_addr <= {mem_addr[31:4], 4'b0000};  // Align to 16-byte block
+                    mem_cycle_count <= 1;
+                    mem_ready <= 1;  // Acknowledge address in cycle 1
+                    mem_rdata <= 32'hxxxxxxxx;  // No data yet
+                    mem_transaction_count <= mem_transaction_count + 1;  // Track memory accesses
+                    if (mem_we) mem_wb_count <= mem_wb_count + 1;  // Count write-backs
+                    $display("[MEM @%0t] Transaction START: addr=%h, block_addr=%h%s", 
+                             $time, mem_addr, {mem_addr[31:4], 4'b0000},
+                             mem_we ? " (WRITE-BACK)" : "");
+                end
+                // Write-back data phase: 6 cycles (2 pipeline fill + 4 data capture)
+                // The bus arbiter registers mem_ready (1 cycle) plus L2 FSM
+                // state register (1 cycle) = 2-cycle pipeline delay before
+                // L2 drives actual data words on mem_addr.
+                // Cycles 1-2: pipeline fill (handshake only, no data capture)
+                // Cycles 3-6: capture data words 0-3 from L2 WB_DATA output
+                else if (mem_we && mem_cycle_count <= 6) begin
+                    if (mem_cycle_count >= 3) begin
+                        memory[mem_block_addr[31:2] + (mem_cycle_count - 3)] <= mem_addr;
+`ifdef DEBUG_VERBOSE
+                        $display("[MEM] WB Cycle %0d: writing memory[%0d] = %h",
+                                 mem_cycle_count - 2, mem_block_addr[31:2] + (mem_cycle_count-3), mem_addr);
+`endif
+                    end
+                    mem_cycle_count <= mem_cycle_count + 1;
+                    mem_ready <= 1;
+                end
+                // Read data phase: provide sequential words (unchanged)
+                else if (!mem_we && mem_cycle_count <= 4) begin
+                    mem_ready <= 1;  // Assert ready for each data word
+                    case (mem_cycle_count)
+                        1: begin
+                            mem_rdata <= memory[mem_block_addr[31:2] + 0];
+`ifdef DEBUG_VERBOSE
+                            $display("[MEM] Cycle %0d: Reading memory[%0d] = %h", 
+                                     mem_cycle_count, mem_block_addr[31:2] + 0, memory[mem_block_addr[31:2] + 0]);
+`endif
+                        end
+                        2: begin
+                            mem_rdata <= memory[mem_block_addr[31:2] + 1];
+`ifdef DEBUG_VERBOSE
+                            $display("[MEM] Cycle %0d: Reading memory[%0d] = %h", 
+                                     mem_cycle_count, mem_block_addr[31:2] + 1, memory[mem_block_addr[31:2] + 1]);
+`endif
+                        end
+                        3: begin
+                            mem_rdata <= memory[mem_block_addr[31:2] + 2];
+`ifdef DEBUG_VERBOSE
+                            $display("[MEM] Cycle %0d: Reading memory[%0d] = %h", 
+                                     mem_cycle_count, mem_block_addr[31:2] + 2, memory[mem_block_addr[31:2] + 2]);
+`endif
+                        end
+                        4: begin
+                            mem_rdata <= memory[mem_block_addr[31:2] + 3];
+`ifdef DEBUG_VERBOSE
+                            $display("[MEM] Cycle %0d: Reading memory[%0d] = %h", 
+                                     mem_cycle_count, mem_block_addr[31:2] + 3, memory[mem_block_addr[31:2] + 3]);
+`endif
+                        end
+                    endcase
+                    
+                    // Transaction complete after word 3 (cycle 4)
+                    if (mem_cycle_count == 4) begin
+`ifdef DEBUG_VERBOSE
+                        $display("[MEM] Transaction COMPLETE");
+`endif
+                    end
+                    
+                    mem_cycle_count <= mem_cycle_count + 1;
+                end else begin
+                    // Counter > 6 (write) or > 4 (read), transaction complete
+                    mem_ready <= 0;
+                    mem_cycle_count <= mem_cycle_count + 1;
+                    if (mem_cycle_count > 10) begin
+                        $display("[MEM @%0t] STUCK: count=%0d, we=%b, addr=%h — forcing reset",
+                                 $time, mem_cycle_count, mem_we, mem_addr);
+                        mem_cycle_count <= 0;  // Force reset to unblock
+                    end
+                end
+            end else begin
+                // mem_valid de-asserted - reset
+                mem_ready <= 0;
+                mem_cycle_count <= 0;
+                mem_rdata <= 32'hxxxxxxxx;
+            end
+        end
+    end
+
+	// =========================================================================
+    // Reference Model / Predictor
+    // =========================================================================
+    // Simple cache model to predict hits/misses and expected data
+    // =========================================================================
+    
+    typedef struct {
+        logic        valid;
+        logic [18:0] tag;
+        logic [1:0]  mesi_state;  // 00=I, 01=S, 10=E, 11=M
+        logic [31:0] data[0:3];   // 4 words per block
+    } cache_line_t;
+    
+    cache_line_t reference_cache[0:511];  // 512 lines, direct-mapped
+    
+    // Initialize reference cache
+    initial begin
+        for (int i = 0; i < 512; i++) begin
+            reference_cache[i].valid = 0;
+            reference_cache[i].tag = 0;
+            reference_cache[i].mesi_state = 2'b00;  // Invalid
+        end
+    end
+    
+    // Predictor function: predicts hit/miss and expected data
+    function automatic void predict_transaction(
+        input logic [31:0] addr,
+        input logic        is_write,
+        output logic       predicted_hit,
+        output logic [31:0] expected_data,
+        output logic [1:0] expected_next_state
+    );
+        logic [18:0] tag;
+        logic [8:0]  index;
+        logic [3:0]  offset;
+        
+        tag    = addr[31:13];
+        index  = addr[12:4];
+        offset = addr[3:0];
+        
+        // Check for hit in reference model
+        if (reference_cache[index].valid && reference_cache[index].tag == tag) begin
+            predicted_hit = 1'b1;
+            expected_data = reference_cache[index].data[offset[3:2]];
+            
+            // Predict next MESI state
+            if (is_write) begin
+                // Write hit: transition to Modified
+                expected_next_state = 2'b11;  // Modified
+            end else begin
+                // Read hit: state unchanged
+                expected_next_state = reference_cache[index].mesi_state;
+            end
+        end else begin
+            predicted_hit = 1'b0;
+            // On miss, data comes from memory
+            expected_data = memory[addr[31:2]];
+            
+            // Predict allocation state
+            if (is_write) begin
+                expected_next_state = 2'b11;  // Modified (RWITM)
+            end else begin
+                // Assume Exclusive if no other copies (simplified)
+                expected_next_state = 2'b10;  // Exclusive
+            end
+        end
+    endfunction
+    
+    // Invalidate reference cache entry (called when another CPU writes to the same line)
+    task automatic invalidate_reference_cache(input logic [31:0] addr, input logic [31:0] write_data);
+        logic [8:0]  index;
+        logic [1:0]  word;
+        logic [31:0] base_byte_addr;
+        index = addr[12:4];
+        word  = addr[3:2];
+        if (reference_cache[index].valid) begin
+            // Merge cpu1's write into the line before flushing
+            reference_cache[index].data[word] = write_data;
+            // Flush dirty line to memory so future miss-path expected_data is correct
+            if (reference_cache[index].mesi_state == 2'b11) begin
+                base_byte_addr = {reference_cache[index].tag, index, 4'b0000};
+                for (int i = 0; i < 4; i++)
+                    memory[base_byte_addr[31:2] + i] = reference_cache[index].data[i];
+            end
+        end
+        reference_cache[index].valid = 1'b0;
+        reference_cache[index].mesi_state = 2'b00;  // Invalid
+    endtask
+
+    // Update reference model after transaction
+    task automatic update_reference_model(
+        input logic [31:0] addr,
+        input logic        is_write,
+        input logic [31:0] write_data
+    );
+        logic [18:0] tag;
+        logic [8:0]  index;
+        logic [3:0]  offset;
+        
+        tag    = addr[31:13];
+        index  = addr[12:4];
+        offset = addr[3:0];
+        
+        if (!reference_cache[index].valid || reference_cache[index].tag != tag) begin
+            // Flush dirty eviction to memory before replacing line
+            if (reference_cache[index].valid && reference_cache[index].mesi_state == 2'b11) begin
+                logic [31:0] evict_base;
+                evict_base = {reference_cache[index].tag, index, 4'b0000};
+                for (int j = 0; j < 4; j++)
+                    memory[evict_base[31:2] + j] = reference_cache[index].data[j];
+            end
+            // Allocate new line
+            reference_cache[index].valid = 1'b1;
+            reference_cache[index].tag = tag;
+            
+            // Load block from memory
+            for (int i = 0; i < 4; i++) begin
+                reference_cache[index].data[i] = memory[{addr[31:4], 4'b0}[31:2] + i];
+            end
+        end
+        
+        if (is_write) begin
+            // Update data and mark Modified
+            reference_cache[index].data[offset[3:2]] = write_data;
+            reference_cache[index].mesi_state = 2'b11;  // Modified
+        end else begin
+            // Read: keep existing state or set Exclusive
+            if (reference_cache[index].mesi_state == 2'b00) begin
+                reference_cache[index].mesi_state = 2'b10;  // Exclusive
+            end
+        end
+    endtask
+
+	// =========================================================================
+    // Scoreboard
+    // =========================================================================
+    // Compares actual results with predicted results
+    // =========================================================================
+    
+    task automatic check_result(
+        input string       operation,
+        input logic [31:0] addr,
+        input logic        is_write,
+        input logic [31:0] actual_data,
+        input logic [31:0] expected_data,
+        input logic        predicted_hit
+    );
+        logic        actual_hit;
+        logic [8:0]  index;
+        logic [18:0] actual_tag;
+        logic [18:0] expected_tag;
+        
+        index = addr[12:4];
+        actual_tag = DUT.ccl0.l1a.dp.tag_array[index];
+        expected_tag = addr[31:13];
+        
+        // Determine actual hit/miss from cpu0_miss signal (inverted)
+        // cpu0_miss is high when completing a miss, so actual_hit is the inverse
+        actual_hit = !cpu0_miss;
+        
+        total_transactions++;
+        
+        // Check prediction accuracy
+        if (actual_hit == predicted_hit) begin
+            correct_predictions++;
+            $display("[SCOREBOARD PASS] %s @ %h: Hit prediction correct (%s)", 
+                     operation, addr, predicted_hit ? "HIT" : "MISS");
+        end else begin
+            incorrect_predictions++;
+            $display("[SCOREBOARD FAIL] %s @ %h: Hit prediction WRONG! Expected %s, Got %s",
+                     operation, addr, predicted_hit ? "HIT" : "MISS", actual_hit ? "HIT" : "MISS");
+        end
+        
+        // Track hit/miss statistics
+        if (actual_hit) cache_hits_observed++;
+        else cache_misses_observed++;
+        
+        // Check data correctness (for reads)
+        if (!is_write) begin
+            read_transactions++;
+            if (actual_data == expected_data) begin
+                $display("[SCOREBOARD PASS] %s @ %h: Data correct: %h", 
+                         operation, addr, actual_data);
+                data_matches++;
+            end else begin
+                $display("[SCOREBOARD FAIL] %s @ %h: Data WRONG! Expected %h, Got %h",
+                         operation, addr, expected_data, actual_data);
+                data_mismatches++;
+            end
+        end
+    endtask
+    
+    // Print scoreboard summary
+    task print_scoreboard();
+        real hit_rate;
+        real prediction_accuracy;
+        real data_accuracy;
+        real coherency_accuracy;
+        
+        if (total_transactions > 0) begin
+            hit_rate = (cache_hits_observed * 100.0) / total_transactions;
+            prediction_accuracy = (correct_predictions * 100.0) / total_transactions;
+        end else begin
+            hit_rate = 0.0;
+            prediction_accuracy = 0.0;
+        end
+        
+        if (read_transactions > 0)
+            data_accuracy = (data_matches * 100.0) / read_transactions;
+        else
+            data_accuracy = 0.0;
+            
+        if (coherency_checks > 0)
+            coherency_accuracy = (coherency_passed * 100.0) / coherency_checks;
+        else
+            coherency_accuracy = 0.0;
+        
+        $display("\n============================================");
+        $display("          TEST RESULTS SUMMARY");
+        $display("============================================");
+        $display("Tests Run:               %0d", test_count);
+        $display("Tests Passed:            %0d", test_passed);
+        $display("Tests Failed:            %0d", test_failed);
+        if (test_failed == 0)
+            $display("Status:                  ALL TESTS PASSED");
+        else
+            $display("Status:                  %0d TEST(S) FAILED", test_failed);
+        
+        $display("\n--- Cache Performance ---");
+        $display("Total Transactions:      %0d", total_transactions);
+        $display("Cache Hits:              %0d", cache_hits_observed);
+        $display("Cache Misses:            %0d", cache_misses_observed);
+        $display("Hit Rate:                %.2f%%", hit_rate);
+        $display("Prediction Accuracy:     %.2f%% (%0d/%0d)", 
+                 prediction_accuracy, correct_predictions, total_transactions);
+        
+        $display("\n--- Data Verification ---");
+        $display("Read Operations:         %0d", read_transactions);
+        $display("Data Correct:            %0d", data_matches);
+        $display("Data Errors:             %0d", data_mismatches);
+        if (read_transactions > 0)
+            $display("Data Accuracy:           %.2f%% (%0d/%0d)", 
+                     data_accuracy, data_matches, read_transactions);
+        else
+            $display("Data Accuracy:           N/A (no reads)");
+        
+        $display("\n--- Coherency Verification ---");
+        $display("Coherency Checks:        %0d", coherency_checks);
+        $display("Coherency Passed:        %0d", coherency_passed);
+        $display("Coherency Failed:        %0d", coherency_failed);
+        if (coherency_checks > 0)
+            $display("Coherency Accuracy:      %.2f%% (%0d/%0d)", 
+                     coherency_accuracy, coherency_passed, coherency_checks);
+        else
+            $display("Coherency Accuracy:      N/A (no coherency tests)");
+        
+        $display("============================================\n");
+    endtask
+	
+	// -------------------------
+    // Test Tasks
+    // -------------------------
+
+    task cpu_read(input [31:0] addr);
+        logic        predicted_hit;
+        logic [31:0] expected_data;
+        logic [1:0]  expected_state;
+        begin
+            // Predict before transaction
+            predict_transaction(addr, 1'b0, predicted_hit, expected_data, expected_state);
+            
+            cpu0_addr = addr;
+            cpu0_we   = 0;
+            cpu0_req  = 1;
+
+            @(posedge clk);
+            while (!cpu0_ready) @(posedge clk);
+
+            cpu0_req = 0;
+            
+            // Check result with scoreboard
+            check_result("READ", addr, 1'b0, cpu0_rdata, expected_data, predicted_hit);
+            
+            // Update reference model
+            update_reference_model(addr, 1'b0, 32'h0);
+            
+            @(posedge clk);
+        end
+    endtask	
+	
+    
+	task cpu_write(input [31:0] addr, input [31:0] data);
+        logic        predicted_hit;
+        logic [31:0] expected_data;
+        logic [1:0]  expected_state;
+        begin
+            // Predict before transaction
+            predict_transaction(addr, 1'b1, predicted_hit, expected_data, expected_state);
+            
+            cpu0_addr  = addr;
+            cpu0_wdata = data;
+            cpu0_we    = 1;
+            cpu0_req   = 1;
+
+            @(posedge clk);
+            while (!cpu0_ready) @(posedge clk);
+
+            cpu0_req = 0;
+            cpu0_we  = 0;
+            
+            // Check result with scoreboard
+            check_result("WRITE", addr, 1'b1, data, expected_data, predicted_hit);
+            
+            // Update reference model
+            update_reference_model(addr, 1'b1, data);
+            
+            @(posedge clk);
+        end
+    endtask	 
+	
+	task print_memory_block(input [31:0] addr);
+	    int mem_index;
+	    begin
+	        mem_index = addr >> 2;  // convert byte address to 32-bit word index
+	        $display("Memory Block @ address %h:", addr);
+	        $display("  [%0d] = %h", mem_index+0, memory[mem_index+0]);
+	        $display("  [%0d] = %h", mem_index+1, memory[mem_index+1]);
+	        $display("  [%0d] = %h", mem_index+2, memory[mem_index+2]);
+	        $display("  [%0d] = %h", mem_index+3, memory[mem_index+3]);
+	    end
+	endtask
+	
+	task print_cache_line(input int idx);
+    begin
+        $display("--------------------------------------------------");
+        $display(" L1 Cache Line @ index %0d (CPU0)", idx);
+        $display("--------------------------------------------------");
+
+        $display("  Tag       : %h",  DUT.ccl0.l1a.dp.tag_array[idx]);
+        $display("  MESI State: %b",  DUT.ccl0.l1a.dp.mesi_array[idx]);
+
+        $display("  Data  : %h %h %h %h",
+                 DUT.ccl0.l1a.dp.data_array[idx][3],
+                 DUT.ccl0.l1a.dp.data_array[idx][2],
+                 DUT.ccl0.l1a.dp.data_array[idx][1],
+                 DUT.ccl0.l1a.dp.data_array[idx][0]);
+
+        $display("--------------------------------------------------");
+    end
+endtask
+
+task print_l2_cache_set(input logic [7:0] set_idx);
+    begin
+        $display("--------------------------------------------------");
+        $display(" L2 Cache Set @ index %0d", set_idx);
+        $display("--------------------------------------------------");
+        
+        for (int way = 0; way < 4; way++) begin
+            $display("  Way %0d:", way);
+            $display("    Tag       : %h", DUT.ccl0.l2.dp.tag_array[way][set_idx]);
+            $display("    MESI State: %b", DUT.ccl0.l2.dp.mesi_array[way][set_idx]);
+            $display("    Data      : %h %h %h %h",
+                     DUT.ccl0.l2.dp.data_array[way][set_idx][3],
+                     DUT.ccl0.l2.dp.data_array[way][set_idx][2],
+                     DUT.ccl0.l2.dp.data_array[way][set_idx][1],
+                     DUT.ccl0.l2.dp.data_array[way][set_idx][0]);
+        end
+        
+        $display("--------------------------------------------------");
+    end
+endtask
+
+task print_cache_line_cpu1(input int idx);
+    begin
+        $display("--------------------------------------------------");
+        $display(" L1 Cache Line @ index %0d (CPU1)", idx);
+        $display("--------------------------------------------------");
+
+        $display("  Tag       : %h",  DUT.ccl0.l1b.dp.tag_array[idx]);
+        $display("  MESI State: %b",  DUT.ccl0.l1b.dp.mesi_array[idx]);
+
+        $display("  Data  : %h %h %h %h",
+                 DUT.ccl0.l1b.dp.data_array[idx][3],
+                 DUT.ccl0.l1b.dp.data_array[idx][2],
+                 DUT.ccl0.l1b.dp.data_array[idx][1],
+                 DUT.ccl0.l1b.dp.data_array[idx][0]);
+
+        $display("--------------------------------------------------");
+    end
+endtask
+
+// CPU1 read task (uses cpu_b interface)
+task cpu1_read(input [31:0] addr);
+    begin
+        cpu1_addr = addr;
+        cpu1_we   = 0;
+        cpu1_req  = 1;
+
+        @(posedge clk);
+        while (!cpu1_ready) @(posedge clk);
+
+        cpu1_req = 0;
+        
+        @(posedge clk);
+    end
+endtask
+
+// CPU1 write task (uses cpu_b interface)
+task cpu1_write(input [31:0] addr, input [31:0] data);
+    begin
+        cpu1_addr  = addr;
+        cpu1_wdata = data;
+        cpu1_we    = 1;
+        cpu1_req   = 1;
+
+        @(posedge clk);
+        while (!cpu1_ready) @(posedge clk);
+
+        cpu1_req = 0;
+        cpu1_we  = 0;
+        
+        @(posedge clk);
+        
+        // CPU1's write invalidates CPU0's copy of this cache line in the reference model
+        // Pass write_data so it gets merged+flushed before invalidating
+        invalidate_reference_cache(addr, data);
+    end
+endtask
+
+// CPU2 read task (cpu_a interface of CCL1)
+task cpu2_read(input [31:0] addr);
+    begin
+        cpu2_addr = addr;
+        cpu2_we   = 0;
+        cpu2_req  = 1;
+
+        @(posedge clk);
+        while (!cpu2_ready) @(posedge clk);
+
+        cpu2_req = 0;
+
+        @(posedge clk);
+    end
+endtask
+
+// CPU2 write task (cpu_a interface of CCL1)
+task cpu2_write(input [31:0] addr, input [31:0] data);
+    begin
+        cpu2_addr  = addr;
+        cpu2_wdata = data;
+        cpu2_we    = 1;
+        cpu2_req   = 1;
+
+        @(posedge clk);
+        while (!cpu2_ready) @(posedge clk);
+
+        cpu2_req = 0;
+        cpu2_we  = 0;
+
+        @(posedge clk);
+
+        // CPU2's write invalidates CPU0's (CCL0) copy in the reference model
+        invalidate_reference_cache(addr, data);
+    end
+endtask
+
+
+	 // -------------------------
+    // Test Sequence
+    // -------------------------
+	
+	integer i;
+
+initial begin
+	clk = 0;
+
+    // Initialize scoreboard counters
+    test_count = 0;
+    test_passed = 0;
+    test_failed = 0;
+    total_transactions = 0;
+    correct_predictions = 0;
+    incorrect_predictions = 0;
+    cache_hits_observed = 0;
+    cache_misses_observed = 0;
+    read_transactions = 0;
+    data_matches = 0;
+    data_mismatches = 0;
+    coherency_checks = 0;
+    coherency_passed = 0;
+    coherency_failed = 0;
+    mem_transaction_count = 0;
+    mem_wb_count = 0;
+
+    // Initialize memory with known patterns (32-bit words)
+
+    for (i = 0; i < 2048; i = i + 1) begin
+        memory[i*4 + 0] = 32'hA0000000 + i;
+        memory[i*4 + 1] = 32'hB0000000 + i;
+        memory[i*4 + 2] = 32'hC0000000 + i;
+        memory[i*4 + 3] = 32'hD0000000 + i;
+    end
+
+    // Reset
+    reset = 1;
+    cpu0_req = 0;
+    cpu0_we = 0;
+    repeat (5) @(posedge clk);
+    reset = 0;
+	
+	
+    $display("\n=== TEST 1: Cold Miss + Allocate ===");		//Reads from index 4
+    test_count++;
+    begin
+        int prev_fails;
+        prev_fails = data_mismatches + incorrect_predictions;
+        cpu_read(32'h0000_0040);
+        $display("CPU Read Data = %h", cpu0_rdata);
+        print_cache_line(4);
+        if (data_mismatches + incorrect_predictions == prev_fails) test_passed++;
+        else test_failed++;
+    end
+			 
+
+    $display("\n=== TEST 2: Hit ===");
+    test_count++;
+    begin
+        int prev_fails;
+        prev_fails = data_mismatches + incorrect_predictions;
+        //Reads from index 4 offset 1
+        cpu_read(32'h0000_0044);
+        print_cache_line(4);
+        $display("CPU Read Data = %h", cpu0_rdata);
+        if (data_mismatches + incorrect_predictions == prev_fails) test_passed++;
+        else test_failed++;
+    end
+
+    $display("\n=== TEST 3: Write Hit (MESI: E->M or S->M) ===");
+    test_count++;
+    begin
+        int prev_fails;
+        logic test3_passed;
+        prev_fails = data_mismatches + incorrect_predictions;
+        test3_passed = 1;
+        //Writes to index 4 offset 2
+        cpu_write(32'h0000_0048, 32'hDEADBEEF);
+        print_cache_line(4);
+        print_memory_block(32'h0000_0040);
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[4] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST3: L1 line is Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST3: L1 MESI should be Modified (11), got %b",
+                     DUT.ccl0.l1a.dp.mesi_array[4]);
+            coherency_failed++;
+            test3_passed = 0;
+        end
+        if (data_mismatches + incorrect_predictions > prev_fails) test3_passed = 0;
+        if (test3_passed) test_passed++; else test_failed++;
+    end
+
+    $display("\n=== TEST 4: Miss on Modified Line -> Write-Back -> Allocate ===");
+    test_count++;
+    begin
+        int prev_fails;
+        logic test4_passed;
+        logic found;
+        logic [19:0] expected_tag;
+        prev_fails = data_mismatches + incorrect_predictions;
+        test4_passed = 1;
+        //Reads from index 4, but its a different address, and its been written to, so needs to writeback and reallocate.
+        cpu_read(32'h0000_2040);
+        $display("CPU Read Data = %h", cpu0_rdata);
+        print_cache_line(4);
+
+        // Verify write-back to L2: address 0x40 should be in L2 with data {a,b,c,d}0000004
+        $display("\n=== Verifying Write-Back to L2 ===");
+        print_l2_cache_set(8'h04);  // 0x40 maps to set 4 in L2
+
+        expected_tag = 20'h00000;  // Tag for address 0x40
+        found = 1'b0;
+        for (int way = 0; way < 4; way++) begin
+            if (DUT.ccl0.l2.dp.tag_array[way][8'h04] == expected_tag &&
+                DUT.ccl0.l2.dp.mesi_array[way][8'h04] != 2'b00) begin
+                found = 1'b1;
+                coherency_checks++;
+                if (DUT.ccl0.l2.dp.data_array[way][8'h04][0] == 32'ha0000004 &&
+                    DUT.ccl0.l2.dp.data_array[way][8'h04][1] == 32'hb0000004 &&
+                    DUT.ccl0.l2.dp.data_array[way][8'h04][2] == 32'hdeadbeef &&
+                    DUT.ccl0.l2.dp.data_array[way][8'h04][3] == 32'hd0000004) begin
+                    $display("[COHERENCY PASS] TEST4: Write-back data correct in L2 way %0d", way);
+                    coherency_passed++;
+                end else begin
+                    $display("[COHERENCY FAIL] TEST4: Write-back data WRONG in L2 way %0d", way);
+                    $display("  Expected: a0000004 b0000004 deadbeef d0000004");
+                    $display("  Got:      %h %h %h %h",
+                             DUT.ccl0.l2.dp.data_array[way][8'h04][0],
+                             DUT.ccl0.l2.dp.data_array[way][8'h04][1],
+                             DUT.ccl0.l2.dp.data_array[way][8'h04][2],
+                             DUT.ccl0.l2.dp.data_array[way][8'h04][3]);
+                    coherency_failed++;
+                    test4_passed = 0;
+                end
+            end
+        end
+        if (!found) begin
+            coherency_checks++;
+            $display("[COHERENCY FAIL] TEST4: Write-back NOT found in L2!");
+            coherency_failed++;
+            test4_passed = 0;
+        end
+
+        print_memory_block(32'h0000_0040);
+        if (data_mismatches + incorrect_predictions > prev_fails) test4_passed = 0;
+        if (test4_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // Coherency Tests
+    // =========================================================================
+
+    $display("\n=== TEST 5: Shared Line (Two Cores Read Same Address) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    // CPU0 reads address 0x80 (new address, will allocate in Exclusive)
+    cpu_read(32'h0000_0080);
+    $display("[CPU0] Read data = %h", cpu0_rdata);
+    print_cache_line(8);  // index = 0x80[11:4] = 8
+    
+    // CPU1 reads the same address (should transition CPU0's L1 to Shared, CPU1 gets Shared)
+    $display("\n[CPU1] Reading same address 0x80...");
+    cpu1_read(32'h0000_0080);
+    $display("[CPU1] Read data = %h", cpu1_rdata);
+    print_cache_line(8);       // CPU0's L1a
+    print_cache_line_cpu1(8);  // CPU1's L1b
+    
+    // Verify both L1s have the line in Shared state (MESI = 01)
+    begin
+        logic [1:0] cpu0_mesi, cpu1_mesi;
+        logic test5_passed;
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[8];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[8];
+        test5_passed = 1;
+        
+        coherency_checks++;
+        if (cpu0_mesi == 2'b01 && cpu1_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] Both L1s have line in Shared state (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] Expected both L1s in Shared (01)");
+            $display("  CPU0 L1: %b, CPU1 L1: %b", cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test5_passed = 0;
+        end
+        
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test5_passed = 0;
+        if (test5_passed)
+            test_passed++;
+        else
+            test_failed++;
+    end
+
+    $display("\n=== TEST 6: Invalidation (Core Writes to Shared Line) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    // CPU0 writes to the shared line - should invalidate CPU1's copy
+    $display("[CPU0] Writing to shared line at 0x80...");
+    cpu_write(32'h0000_0080, 32'hCAFEBABE);
+    print_cache_line(8);       // CPU0's L1a
+    print_cache_line_cpu1(8);  // CPU1's L1b
+    
+    // Verify CPU0 has Modified, CPU1 has Invalid
+    begin
+        logic [1:0] cpu0_mesi, cpu1_mesi;
+        logic test6_passed;
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[8];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[8];
+        test6_passed = 1;
+        
+        coherency_checks++;
+        if (cpu0_mesi == 2'b11 && cpu1_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] CPU0 Modified (11), CPU1 Invalidated (00)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] Expected CPU0 Modified (11), CPU1 Invalid (00)");
+            $display("  CPU0 L1: %b, CPU1 L1: %b", cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test6_passed = 0;
+        end
+        
+        // Verify CPU0 has the written data
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.data_array[8][0] == 32'hCAFEBABE) begin
+            $display("[COHERENCY PASS] CPU0 has written data: %h", DUT.ccl0.l1a.dp.data_array[8][0]);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] CPU0 data incorrect: %h", DUT.ccl0.l1a.dp.data_array[8][0]);
+            coherency_failed++;
+            test6_passed = 0;
+        end
+        
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test6_passed = 0;
+        if (test6_passed)
+            test_passed++;
+        else
+            test_failed++;
+    end
+
+    $display("\n=== TEST 7: Modified -> Shared Transition (Intervention) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    // CPU0 already has the line at 0x80 in Modified state with data 0xCAFEBABE
+    // CPU1 reads the same address - should get data from CPU0, both downgrade to Shared
+    $display("[CPU1] Reading from CPU0's modified line at 0x80...");
+    cpu1_read(32'h0000_0080);  // Expect miss, should get modified data
+    print_cache_line(8);       // CPU0's L1a
+    print_cache_line_cpu1(8);  // CPU1's L1b
+    
+    // Verify both CPUs have Shared state and correct data
+    begin
+        logic [1:0] cpu0_mesi, cpu1_mesi;
+        logic [31:0] cpu0_data, cpu1_data;
+        logic test7_passed;
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[8];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[8];
+        cpu0_data = DUT.ccl0.l1a.dp.data_array[8][0];
+        cpu1_data = DUT.ccl0.l1b.dp.data_array[8][0];
+        test7_passed = 1;
+        
+        coherency_checks++;
+        if (cpu0_mesi == 2'b01 && cpu1_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] Both CPUs Shared (01, 01) after intervention");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] Expected both Shared (01)");
+            $display("  CPU0 L1: %b, CPU1 L1: %b", cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test7_passed = 0;
+        end
+        
+        // Verify both have the modified data (cache-to-cache transfer)
+        coherency_checks++;
+        if (cpu0_data == 32'hCAFEBABE && cpu1_data == 32'hCAFEBABE) begin
+            $display("[COHERENCY PASS] Both CPUs have correct data: %h", cpu1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] Data mismatch - CPU0: %h, CPU1: %h", cpu0_data, cpu1_data);
+            coherency_failed++;
+            test7_passed = 0;
+        end
+        
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test7_passed = 0;
+        if (test7_passed)
+            test_passed++;
+        else
+            test_failed++;
+    end
+
+    $display("\n=== TEST 8: Write-After-Write (Sequential Invalidation) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    // Start fresh: Both CPUs read address 0xC0 to get Shared copies
+    $display("[CPU0] Reading address 0xC0 to establish shared state...");
+    cpu_read(32'h0000_00C0);  // Cold miss
+    $display("[CPU1] Reading same address 0xC0...");
+    cpu1_read(32'h0000_00C0);  // Should hit in L2 or get Shared
+    print_cache_line(12);      // CPU0's L1a (index 12 for 0xC0)
+    print_cache_line_cpu1(12); // CPU1's L1b
+    
+    // CPU0 writes first (invalidates CPU1)
+    $display("[CPU0] Writing to shared line at 0xC0...");
+    cpu_write(32'h0000_00C0, 32'hDEADBEEF);
+    print_cache_line(12);
+    print_cache_line_cpu1(12);
+    
+    // CPU1 writes second (should miss, then invalidate CPU0)
+    $display("[CPU1] Writing to same line at 0xC0 (should invalidate CPU0)...");
+    cpu1_write(32'h0000_00C0, 32'hFEEDFACE);
+    print_cache_line(12);
+    print_cache_line_cpu1(12);
+    
+    // Verify CPU1 has Modified, CPU0 has Invalid
+    begin
+        logic [1:0] cpu0_mesi, cpu1_mesi;
+        logic [31:0] cpu1_data;
+        logic test8_passed;
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[12];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[12];
+        cpu1_data = DUT.ccl0.l1b.dp.data_array[12][0];
+        test8_passed = 1;
+        
+        coherency_checks++;
+        if (cpu0_mesi == 2'b00 && cpu1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] CPU0 Invalid (00), CPU1 Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] Expected CPU0 Invalid (00), CPU1 Modified (11)");
+            $display("  CPU0 L1: %b, CPU1 L1: %b", cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test8_passed = 0;
+        end
+        
+        // Verify CPU1 has the final written data
+        coherency_checks++;
+        if (cpu1_data == 32'hFEEDFACE) begin
+            $display("[COHERENCY PASS] CPU1 has final written data: %h", cpu1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] CPU1 data incorrect: %h (expected FEEDFACE)", cpu1_data);
+            coherency_failed++;
+            test8_passed = 0;
+        end
+        
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test8_passed = 0;
+        if (test8_passed)
+            test_passed++;
+        else
+            test_failed++;
+    end
+
+    $display("\n=== TEST 9: Simultaneous Write Arbitration ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    // Both CPUs attempt to write to the same address simultaneously
+    // Test arbiter's ability to serialize conflicting requests
+    $display("[TEST9] Both CPUs writing to address 0x100 simultaneously...");
+    
+    // Manually drive both CPU interfaces in the same cycle
+    begin
+        logic test9_passed;
+        logic [1:0] cpu0_final_mesi, cpu1_final_mesi;
+        logic [31:0] cpu0_final_data, cpu1_final_data;
+        int winner_cpu;
+        
+        test9_passed = 1;
+        
+        // Drive both CPUs simultaneously
+        @(posedge clk);
+        cpu0_req = 1'b1;
+        cpu0_addr = 32'h0000_0100;
+        cpu0_wdata = 32'hAAAAAAAA;
+        cpu0_we = 1'b1;
+        
+        cpu1_req = 1'b1;
+        cpu1_addr = 32'h0000_0100;
+        cpu1_wdata = 32'hBBBBBBBB;
+        cpu1_we = 1'b1;
+        
+        $display("[TEST9 @%0t] CPU0 write request: addr=%h, data=%h", $time, cpu0_addr, cpu0_wdata);
+        $display("[TEST9 @%0t] CPU1 write request: addr=%h, data=%h", $time, cpu1_addr, cpu1_wdata);
+        
+        // Wait for arbiter to grant one request
+        @(posedge clk);
+        
+        // Keep requests active until both complete
+        // Wait for CPU0 to complete
+        wait(cpu0_ready == 1'b1);
+        @(posedge clk);
+        cpu0_req = 1'b0;
+        cpu0_we = 1'b0;
+        $display("[TEST9 @%0t] CPU0 write completed", $time);
+        
+        // Wait for CPU1 to complete (may need to wait for grant)
+        wait(cpu1_ready == 1'b1);
+        @(posedge clk);
+        cpu1_req = 1'b0;
+        cpu1_we = 1'b0;
+        $display("[TEST9 @%0t] CPU1 write completed", $time);
+        
+        // Give time for final MESI updates
+        repeat(5) @(posedge clk);
+        
+        // Check final states
+        cpu0_final_mesi = DUT.ccl0.l1a.dp.mesi_array[16];  // Index 16 for 0x100
+        cpu1_final_mesi = DUT.ccl0.l1b.dp.mesi_array[16];
+        cpu0_final_data = DUT.ccl0.l1a.dp.data_array[16][0];
+        cpu1_final_data = DUT.ccl0.l1b.dp.data_array[16][0];
+        
+        print_cache_line(16);
+        print_cache_line_cpu1(16);
+        
+        // One should be Modified, the other Invalid
+        // Determine which CPU won based on final states
+        coherency_checks++;
+        if ((cpu0_final_mesi == 2'b11 && cpu1_final_mesi == 2'b00) ||
+            (cpu0_final_mesi == 2'b00 && cpu1_final_mesi == 2'b11)) begin
+            
+            if (cpu0_final_mesi == 2'b11) begin
+                winner_cpu = 0;
+                $display("[COHERENCY PASS] CPU0 won arbitration: Modified (11), CPU1: Invalid (00)");
+            end else begin
+                winner_cpu = 1;
+                $display("[COHERENCY PASS] CPU1 won arbitration: Modified (11), CPU0: Invalid (00)");
+            end
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] Invalid final states after simultaneous writes");
+            $display("  CPU0 L1: %b, CPU1 L1: %b", cpu0_final_mesi, cpu1_final_mesi);
+            coherency_failed++;
+            test9_passed = 0;
+            winner_cpu = -1;
+        end
+        
+        // Verify winner has their data
+        if (winner_cpu != -1) begin
+            coherency_checks++;
+            if (winner_cpu == 0 && cpu0_final_data == 32'hAAAAAAAA) begin
+                $display("[COHERENCY PASS] CPU0 (winner) has correct data: %h", cpu0_final_data);
+                coherency_passed++;
+            end else if (winner_cpu == 1 && cpu1_final_data == 32'hBBBBBBBB) begin
+                $display("[COHERENCY PASS] CPU1 (winner) has correct data: %h", cpu1_final_data);
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] Winner's data incorrect - CPU0: %h, CPU1: %h", 
+                         cpu0_final_data, cpu1_final_data);
+                coherency_failed++;
+                test9_passed = 0;
+            end
+        end
+        
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test9_passed = 0;
+        if (test9_passed)
+            test_passed++;
+        else
+            test_failed++;
+    end
+
+
+    // =========================================================================
+    // TEST 10: Dirty Eviction with Active Sharer
+    // =========================================================================
+    // CPU0 and CPU1 share line 0x140 (index 20). CPU0 upgrades to Modified,
+    // then a capacity miss on 0x2140 (same index, different tag) forces eviction.
+    // Verify the written data is preserved in L2.
+    // =========================================================================
+    $display("\n=== TEST 10: Dirty Eviction (Modified Line -> Write-Back -> New Alloc) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic [1:0]  cpu0_mesi, cpu1_mesi;
+        logic [31:0] wb_word0;
+        logic        found_wb;
+        logic        test10_passed;
+        logic [19:0] wb_tag;
+        int          wb_set;
+        test10_passed = 1;
+
+        // Step 1: CPU0 reads 0x140 → cold miss, gets Exclusive
+        $display("[TEST10] CPU0 reading 0x140 (cold miss -> Exclusive)...");
+        cpu_read(32'h0000_0140);
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[20];
+        $display("[TEST10] CPU0 MESI after read: %b (expect 10=Exclusive)", cpu0_mesi);
+
+        // Step 2: CPU1 reads 0x140 → CPU0 downgrades to Shared, CPU1 gets Shared
+        $display("[TEST10] CPU1 reading 0x140 (share -> both Shared)...");
+        cpu1_read(32'h0000_0140);
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[20];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[20];
+        print_cache_line(20);
+        print_cache_line_cpu1(20);
+        coherency_checks++;
+        if (cpu0_mesi == 2'b01 && cpu1_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST10 step2: Both Shared (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST10 step2: Expected both Shared (01), got CPU0=%b CPU1=%b",
+                     cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test10_passed = 0;
+        end
+
+        // Step 3: CPU0 writes 0x140 → upgrades to Modified, CPU1 invalidated
+        $display("[TEST10] CPU0 writing 0x140 with FACADE00 (Shared -> Modified)...");
+        cpu_write(32'h0000_0140, 32'hFACADE00);
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[20];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[20];
+        print_cache_line(20);
+        coherency_checks++;
+        if (cpu0_mesi == 2'b11 && cpu1_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] TEST10 step3: CPU0 Modified (11), CPU1 Invalid (00)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST10 step3: Expected CPU0 Modified (11)/CPU1 Invalid (00), got %b/%b",
+                     cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test10_passed = 0;
+        end
+
+        // Step 4: CPU0 reads 0x2140 (same index 20, tag 1) → forces eviction + WB of 0x140
+        $display("[TEST10] CPU0 reading 0x2140 (same index, different tag -> evicts 0x140)...");
+        cpu_read(32'h0000_2140);
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[20];
+        print_cache_line(20);
+        coherency_checks++;
+        if (cpu0_mesi != 2'b00) begin
+            $display("[COHERENCY PASS] TEST10 step4: New line allocated at index 20, MESI=%b", cpu0_mesi);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST10 step4: Line allocation failed, MESI=Invalid");
+            coherency_failed++;
+            test10_passed = 0;
+        end
+
+        // Step 5: Verify written-back data (FACADE00) is now in L2 at 0x140's set
+        wb_set = 20;       // addr[12:4] for 0x140
+        wb_tag = 20'h00000; // addr[31:13] for 0x140
+        found_wb = 0;
+        for (int way = 0; way < 4; way++) begin
+            if (DUT.ccl0.l2.dp.tag_array[way][wb_set] == wb_tag &&
+                DUT.ccl0.l2.dp.mesi_array[way][wb_set] != 2'b00) begin
+                found_wb = 1;
+                wb_word0 = DUT.ccl0.l2.dp.data_array[way][wb_set][0];
+                coherency_checks++;
+                if (wb_word0 == 32'hFACADE00) begin
+                    $display("[COHERENCY PASS] TEST10 step5: Evicted dirty data in L2 way %0d: %h", way, wb_word0);
+                    coherency_passed++;
+                end else begin
+                    $display("[COHERENCY FAIL] TEST10 step5: L2 data wrong in way %0d: %h (expected FACADE00)", way, wb_word0);
+                    coherency_failed++;
+                    test10_passed = 0;
+                end
+            end
+        end
+        if (!found_wb) begin
+            coherency_checks++;
+            $display("[COHERENCY FAIL] TEST10 step5: Evicted line 0x140 NOT found in L2!");
+            coherency_failed++;
+            test10_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test10_passed = 0;
+        if (test10_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 11: False Sharing (Two cores writing different words in same line)
+    // =========================================================================
+    // CPU0 and CPU1 chase each other's writes on line 0x1C0 (index 28).
+    // CPU0 writes word[0]=DEAD0001, CPU1 writes word[1]=BEEF0002.
+    // After both writes complete, verify via read-back that each core
+    // can observe the other's word.
+    // =========================================================================
+    $display("\n=== TEST 11: False Sharing (Ping-Pong Write on Same Cache Line) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic [1:0]  cpu0_mesi, cpu1_mesi;
+        logic [31:0] cpu0_w0, cpu0_w1, cpu1_w0, cpu1_w1;
+        logic        test11_passed;
+        test11_passed = 1;
+
+        // Step 1: CPU0 writes word[0] at 0x1C0 → write miss, gets Modified
+        $display("[TEST11] CPU0 writing word[0] at 0x1C0 = DEAD0001...");
+        cpu_write(32'h0000_01C0, 32'hDEAD0001);
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[28];
+        print_cache_line(28);
+        coherency_checks++;
+        if (cpu0_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST11 step1: CPU0 Modified (11) after write");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST11 step1: CPU0 MESI=%b (expected 11=Modified)", cpu0_mesi);
+            coherency_failed++;
+            test11_passed = 0;
+        end
+
+        // Step 2: CPU1 writes word[1] at 0x1C4 → invalidates CPU0, CPU1 gets Modified
+        $display("[TEST11] CPU1 writing word[1] at 0x1C4 = BEEF0002 (should invalidate CPU0)...");
+        cpu1_write(32'h0000_01C4, 32'hBEEF0002);
+        cpu0_mesi = DUT.ccl0.l1a.dp.mesi_array[28];
+        cpu1_mesi = DUT.ccl0.l1b.dp.mesi_array[28];
+        print_cache_line(28);
+        print_cache_line_cpu1(28);
+        coherency_checks++;
+        if (cpu0_mesi == 2'b00 && cpu1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST11 step2: CPU0 Invalid (00), CPU1 Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST11 step2: Expected CPU0=00/CPU1=11, got %b/%b",
+                     cpu0_mesi, cpu1_mesi);
+            coherency_failed++;
+            test11_passed = 0;
+        end
+
+        // Step 3: CPU0 reads back 0x1C0 → should see DEAD0001 (its own write, preserved via WB)
+        $display("[TEST11] CPU0 reading back 0x1C0 (should see DEAD0001)...");
+        cpu_read(32'h0000_01C0);
+        cpu0_w0 = DUT.ccl0.l1a.dp.data_array[28][0];
+        coherency_checks++;
+        if (cpu0_w0 == 32'hDEAD0001) begin
+            $display("[COHERENCY PASS] TEST11 step3: CPU0 reads correct word[0]: %h", cpu0_w0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST11 step3: CPU0 word[0]=%h (expected DEAD0001)", cpu0_w0);
+            coherency_failed++;
+            test11_passed = 0;
+        end
+
+        // Step 4: CPU0 reads back 0x1C4 → should also see BEEF0002 (same line, word[1])
+        cpu0_w1 = DUT.ccl0.l1a.dp.data_array[28][1];
+        coherency_checks++;
+        if (cpu0_w1 == 32'hBEEF0002) begin
+            $display("[COHERENCY PASS] TEST11 step4: CPU0 sees CPU1's word[1]: %h", cpu0_w1);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST11 step4: CPU0 word[1]=%h (expected BEEF0002)", cpu0_w1);
+            coherency_failed++;
+            test11_passed = 0;
+        end
+
+        // Step 5: CPU1 reads back 0x1C4 → should see BEEF0002
+        $display("[TEST11] CPU1 reading back 0x1C4 (should see BEEF0002)...");
+        cpu1_read(32'h0000_01C4);
+        cpu1_w1 = DUT.ccl0.l1b.dp.data_array[28][1];
+        coherency_checks++;
+        if (cpu1_w1 == 32'hBEEF0002) begin
+            $display("[COHERENCY PASS] TEST11 step5: CPU1 reads correct word[1]: %h", cpu1_w1);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST11 step5: CPU1 word[1]=%h (expected BEEF0002)", cpu1_w1);
+            coherency_failed++;
+            test11_passed = 0;
+        end
+
+        // Step 6: CPU1 also sees CPU0's word[0] in the same line
+        cpu1_w0 = DUT.ccl0.l1b.dp.data_array[28][0];
+        coherency_checks++;
+        if (cpu1_w0 == 32'hDEAD0001) begin
+            $display("[COHERENCY PASS] TEST11 step6: CPU1 sees CPU0's word[0]: %h", cpu1_w0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST11 step6: CPU1 word[0]=%h (expected DEAD0001)", cpu1_w0);
+            coherency_failed++;
+            test11_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test11_passed = 0;
+        if (test11_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 12: L1 Miss, L2 Hit (Clean)
+    // =========================================================================
+    // CPU0 reads A=0x300 (L1 idx 48, cold miss, fills both L1 and L2).
+    // CPU0 reads B=0x2300 (same L1 idx 48, different tag) -> evicts clean A from L1;
+    // L2 is inclusive so A remains in L2 set 48.
+    // CPU0 re-reads A -> L1 miss, L2 hit: no main-memory transaction.
+    // =========================================================================
+    $display("\n=== TEST 12: L1 Miss, L2 Hit (Clean) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        found_a_in_l2;
+        logic        test12_passed;
+        int          mc_before, mc_after;
+        test12_passed = 1;
+
+        // Step 1: cold miss for A=0x300 -> fills L1[48] and L2 set 48
+        $display("[TEST12] Step 1: CPU0 reads A=0x300 (cold miss)...");
+        cpu_read(32'h0000_0300);
+        print_cache_line(48);
+        print_l2_cache_set(8'd48);
+
+        // Verify A is in L2 after step 1 (inclusive L2 policy)
+        found_a_in_l2 = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][48] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][48] != 2'b00) begin
+                found_a_in_l2 = 1;
+            end
+        end
+        coherency_checks++;
+        if (found_a_in_l2) begin
+            $display("[COHERENCY PASS] TEST12 step1: A is in L2 set 48 after cold miss");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST12 step1: A not found in L2 set 48 after cold miss!");
+            coherency_failed++;
+            test12_passed = 0;
+        end
+
+        // Step 2: read B=0x2300 (same L1 index 48, tag=1) -> evicts clean A from L1
+        //         B misses L2 too (fresh), fills L2 set 48 way 1; A stays in L2 way 0
+        $display("[TEST12] Step 2: CPU0 reads B=0x2300 (same L1 idx, evicts A from L1)...");
+        cpu_read(32'h0000_2300);
+        print_cache_line(48);
+        print_l2_cache_set(8'd48);
+
+        // Verify A is STILL in L2 after being evicted from L1 (clean eviction)
+        found_a_in_l2 = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][48] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][48] != 2'b00) begin
+                found_a_in_l2 = 1;
+            end
+        end
+        coherency_checks++;
+        if (found_a_in_l2) begin
+            $display("[COHERENCY PASS] TEST12 step2: A still in L2 after L1 eviction");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST12 step2: A NOT in L2 after L1 clean eviction!");
+            coherency_failed++;
+            test12_passed = 0;
+        end
+
+        // Step 3: re-read A=0x300 -> L1 miss, L2 hit, NO memory access
+        $display("[TEST12] Step 3: CPU0 re-reads A=0x300 (L1 miss, L2 hit expected)...");
+        mc_before = mem_transaction_count;
+        cpu_read(32'h0000_0300);
+        mc_after  = mem_transaction_count;
+        print_cache_line(48);
+
+        // Verify data is correct (L2 served correct clean data)
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.data_array[48][0] == memory[32'h0000_0300 >> 2]) begin
+            $display("[COHERENCY PASS] TEST12 step3: L1[48] data correct after L2 hit: %h",
+                     DUT.ccl0.l1a.dp.data_array[48][0]);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST12 step3: L1[48] data %h, expected %h",
+                     DUT.ccl0.l1a.dp.data_array[48][0], memory[32'h0000_0300 >> 2]);
+            coherency_failed++;
+            test12_passed = 0;
+        end
+
+        // Verify no new main-memory transaction (L2 hit confirmed)
+        coherency_checks++;
+        if (mc_after == mc_before) begin
+            $display("[COHERENCY PASS] TEST12 step3: No memory access (L2 hit confirmed, mc=%0d)",
+                     mc_after);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST12 step3: %0d memory transaction(s) occurred, expected L2 hit",
+                     mc_after - mc_before);
+            coherency_failed++;
+            test12_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test12_passed = 0;
+        if (test12_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 13: L1 Miss, L2 Hit (Dirty)
+    // =========================================================================
+    // CPU0 reads C=0x400, writes it (Modified), then reads D=0x2400 (same L1 idx 64)
+    // which forces a dirty eviction: L1 write-backs C to L2.  L2 holds C with
+    // dirty data.  CPU0 re-reads C -> L1 miss, L2 hit, dirty data served from L2.
+    // =========================================================================
+    $display("\n=== TEST 13: L1 Miss, L2 Hit (Dirty) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        found_c_in_l2;
+        logic [31:0] c_word0_l2;
+        logic        test13_passed;
+        int          mc_before, mc_after;
+        test13_passed = 1;
+
+        // Step 1: cold miss for C=0x400
+        $display("[TEST13] Step 1: CPU0 reads C=0x400 (cold miss)...");
+        cpu_read(32'h0000_0400);
+
+        // Step 2: write C -> Modified
+        $display("[TEST13] Step 2: CPU0 writes C=0x400 = 1234ABCD (Exclusive->Modified)...");
+        cpu_write(32'h0000_0400, 32'h1234ABCD);
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[64] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST13 step2: L1[64] Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST13 step2: L1[64] MESI=%b (expected 11=Modified)",
+                     DUT.ccl0.l1a.dp.mesi_array[64]);
+            coherency_failed++;
+            test13_passed = 0;
+        end
+
+        // Step 3: read D=0x2400 (same L1 idx 64) -> dirty eviction of C to L2
+        //         D misses L2, fills from memory; L2 set 64 now holds dirty C + clean D
+        $display("[TEST13] Step 3: CPU0 reads D=0x2400 (evicts dirty C to L2)...");
+        cpu_read(32'h0000_2400);
+        print_cache_line(64);
+        print_l2_cache_set(8'd64);
+
+        // Verify dirty C (tag=0) is in L2 set 64 with written data
+        found_c_in_l2 = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][64] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][64] != 2'b00) begin
+                found_c_in_l2 = 1;
+                c_word0_l2 = DUT.ccl0.l2.dp.data_array[w][64][0];
+                coherency_checks++;
+                if (c_word0_l2 == 32'h1234ABCD) begin
+                    $display("[COHERENCY PASS] TEST13 step3: Dirty C in L2 way %0d, word[0]=%h",
+                             w, c_word0_l2);
+                    coherency_passed++;
+                end else begin
+                    $display("[COHERENCY FAIL] TEST13 step3: L2 way %0d word[0]=%h (expected 1234ABCD)",
+                             w, c_word0_l2);
+                    coherency_failed++;
+                    test13_passed = 0;
+                end
+            end
+        end
+        if (!found_c_in_l2) begin
+            coherency_checks++;
+            $display("[COHERENCY FAIL] TEST13 step3: Dirty C NOT found in L2 set 64!");
+            coherency_failed++;
+            test13_passed = 0;
+        end
+
+        // Step 4: re-read C=0x400 -> L1 miss, L2 hit (dirty data served), NO memory access
+        $display("[TEST13] Step 4: CPU0 re-reads C=0x400 (L1 miss, L2 dirty hit expected)...");
+        mc_before = mem_transaction_count;
+        cpu_read(32'h0000_0400);
+        mc_after  = mem_transaction_count;
+        print_cache_line(64);
+
+        // Verify dirty data was retrieved correctly
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.data_array[64][0] == 32'h1234ABCD) begin
+            $display("[COHERENCY PASS] TEST13 step4: L1[64] has dirty data from L2: %h",
+                     DUT.ccl0.l1a.dp.data_array[64][0]);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST13 step4: L1[64] word[0]=%h (expected 1234ABCD from L2)",
+                     DUT.ccl0.l1a.dp.data_array[64][0]);
+            coherency_failed++;
+            test13_passed = 0;
+        end
+
+        // Verify no new main-memory transaction (L2 served the dirty data)
+        coherency_checks++;
+        if (mc_after == mc_before) begin
+            $display("[COHERENCY PASS] TEST13 step4: No memory access (L2 dirty hit confirmed)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST13 step4: %0d memory transaction(s), expected L2 hit",
+                     mc_after - mc_before);
+            coherency_failed++;
+            test13_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test13_passed = 0;
+        if (test13_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 14: L1 Miss, L2 Miss -> Verify L2 Allocation
+    // =========================================================================
+    // Test 1 already covered the basic cold-miss path.  This test adds explicit
+    // verification that L2 allocated the line correctly: correct tag, valid MESI
+    // state, and all 4 words matching the original memory content.
+    // =========================================================================
+    $display("\n=== TEST 14: L1 Miss, L2 Miss (L2 Allocation Verified) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        found_e_in_l2;
+        logic        test14_passed;
+        int          e_wbase;       // word-index base for addr 0x500
+        test14_passed = 1;
+        e_wbase = 32'h0000_0500 >> 2;  // = 320 (0x140)
+
+        $display("[TEST14] CPU0 reads E=0x500 (cold miss, L1 idx 80, L2 set 80)...");
+        cpu_read(32'h0000_0500);
+        print_cache_line(80);
+        print_l2_cache_set(8'd80);
+
+        // Verify E is in L2 set 80 with correct tag and data
+        found_e_in_l2 = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][80] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][80] != 2'b00) begin
+                found_e_in_l2 = 1;
+
+                // Verify all 4 words match original memory content
+                coherency_checks++;
+                if (DUT.ccl0.l2.dp.data_array[w][80][0] == memory[e_wbase + 0] &&
+                    DUT.ccl0.l2.dp.data_array[w][80][1] == memory[e_wbase + 1] &&
+                    DUT.ccl0.l2.dp.data_array[w][80][2] == memory[e_wbase + 2] &&
+                    DUT.ccl0.l2.dp.data_array[w][80][3] == memory[e_wbase + 3]) begin
+                    $display("[COHERENCY PASS] TEST14: L2 way %0d allocated E with correct data: %h %h %h %h",
+                             w,
+                             DUT.ccl0.l2.dp.data_array[w][80][0],
+                             DUT.ccl0.l2.dp.data_array[w][80][1],
+                             DUT.ccl0.l2.dp.data_array[w][80][2],
+                             DUT.ccl0.l2.dp.data_array[w][80][3]);
+                    coherency_passed++;
+                end else begin
+                    $display("[COHERENCY FAIL] TEST14: L2 way %0d data wrong!", w);
+                    $display("  Expected: %h %h %h %h",
+                             memory[e_wbase+0], memory[e_wbase+1],
+                             memory[e_wbase+2], memory[e_wbase+3]);
+                    $display("  Got:      %h %h %h %h",
+                             DUT.ccl0.l2.dp.data_array[w][80][0],
+                             DUT.ccl0.l2.dp.data_array[w][80][1],
+                             DUT.ccl0.l2.dp.data_array[w][80][2],
+                             DUT.ccl0.l2.dp.data_array[w][80][3]);
+                    coherency_failed++;
+                    test14_passed = 0;
+                end
+
+                // Verify MESI is a valid post-allocation state (not Invalid)
+                coherency_checks++;
+                if (DUT.ccl0.l2.dp.mesi_array[w][80] == 2'b10 ||
+                    DUT.ccl0.l2.dp.mesi_array[w][80] == 2'b01) begin
+                    $display("[COHERENCY PASS] TEST14: L2 MESI=%b (valid allocation state: E or S)",
+                             DUT.ccl0.l2.dp.mesi_array[w][80]);
+                    coherency_passed++;
+                end else begin
+                    $display("[COHERENCY FAIL] TEST14: L2 MESI=%b (expected E=10 or S=01 after cold fill)",
+                             DUT.ccl0.l2.dp.mesi_array[w][80]);
+                    coherency_failed++;
+                    test14_passed = 0;
+                end
+            end
+        end
+        if (!found_e_in_l2) begin
+            coherency_checks++;
+            $display("[COHERENCY FAIL] TEST14: E=0x500 NOT found in L2 set 80 after cold miss!");
+            coherency_failed++;
+            test14_passed = 0;
+        end
+
+        // Verify L1 was also allocated correctly
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[80] != 2'b00 &&
+            DUT.ccl0.l1a.dp.tag_array[80]  == 19'h00000) begin
+            $display("[COHERENCY PASS] TEST14: L1[80] allocated correctly, tag=%h MESI=%b",
+                     DUT.ccl0.l1a.dp.tag_array[80], DUT.ccl0.l1a.dp.mesi_array[80]);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST14: L1[80] allocation wrong, tag=%h MESI=%b",
+                     DUT.ccl0.l1a.dp.tag_array[80], DUT.ccl0.l1a.dp.mesi_array[80]);
+            coherency_failed++;
+            test14_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test14_passed = 0;
+        if (test14_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 15: L2 Capacity Conflict — 4-way Full + Dirty LRU Eviction
+    // =========================================================================
+    // Five addresses all map to L2 set 32 (addr[11:4]=0x20) but carry
+    // distinct L2 tags (addr[31:12] = 0..4), within the 32 KB memory range.
+    //
+    //   A0 = 0x0000_0200  L2 tag=0, L1 idx=32
+    //   A1 = 0x0000_1200  L2 tag=1, L1 idx=288
+    //   A2 = 0x0000_2200  L2 tag=2, L1 idx=32
+    //   A3 = 0x0000_3200  L2 tag=3, L1 idx=288
+    //   A4 = 0x0000_4200  L2 tag=4, L1 idx=32 (same as A0/A2)
+    //
+    // Sequence:
+    //   1. Read A0         -> cold miss fills L2[set32][way0]
+    //   2. Write A0        -> L1 Modified
+    //   3. Read A1         -> fills L2[set32][way1]; L1[32]=A0(M) undisturbed
+    //   4. Read A2         -> L1[32] evicts dirty A0 -> WB to L2 (way0 becomes M)
+    //                         L2 cold miss for A2 fills way2
+    //   5. Read A3         -> fills L2[set32][way3]; L2 set32 now FULL
+    //                         lru_counter[32]=0 -> next eviction = way0 (A0, dirty)
+    //   6. Read A4         -> L1[32] evicts clean A2, L2 miss + full
+    //                         LRU evicts way0 (A0, dirty) -> WB to memory
+    //                         Fills A4 from memory
+    //   Verify: 2 memory transactions during step 6 (1 WB + 1 fill),
+    //           A0 absent from L2, A4 present, memory[A0_w0] == 0xBB000001
+    // =========================================================================
+    $display("\n=== TEST 15: L2 Capacity Conflict (4-way Full + Dirty LRU Eviction) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test15_passed;
+        logic        found;
+        logic [1:0]  a0_way;
+        logic        a0_found_after_evict;
+        logic        a4_found_after_evict;
+        int          mc_before, mc_after, wb_before, wb_after;
+        logic [31:0] a0_w0_in_mem;
+
+        test15_passed = 1;
+        // Note: L2 set index = addr[11:4]; L2 tag = addr[31:12]
+
+        // ------------------------------------------------------------------
+        // Step 1: Cold miss for A0 -> fills L2[set 32][way0]
+        // ------------------------------------------------------------------
+        $display("[TEST15] Step 1: CPU0 reads A0=0x0200 (cold miss)...");
+        cpu_read(32'h0000_0200);
+        print_l2_cache_set(8'h20);
+
+        // ------------------------------------------------------------------
+        // Step 2: Write A0 -> L1[32] Modified (L2 still Exclusive)
+        // ------------------------------------------------------------------
+        $display("[TEST15] Step 2: CPU0 writes A0=0x0200 word[0] = 0xBB000001...");
+        cpu_write(32'h0000_0200, 32'hBB000001);
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[32] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST15 step2: L1[32] Modified (11) after write");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step2: L1[32] MESI=%b (expected 11=Modified)",
+                     DUT.ccl0.l1a.dp.mesi_array[32]);
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        // ------------------------------------------------------------------
+        // Step 3: Read A1 -> fills L2 way1; L1[32]=A0(M) not evicted (L1 idx 288)
+        // ------------------------------------------------------------------
+        $display("[TEST15] Step 3: CPU0 reads A1=0x1200 (fills L2 way1)...");
+        cpu_read(32'h0000_1200);
+
+        // ------------------------------------------------------------------
+        // Step 4: Read A2 -> L1[32] evicts dirty A0 to L2 (way0 becomes Modified);
+        //                    L2 fills A2 into way2
+        // ------------------------------------------------------------------
+        $display("[TEST15] Step 4: CPU0 reads A2=0x2200 (dirty WB A0->L2, fills way2)...");
+        cpu_read(32'h0000_2200);
+
+        // Check A0's way in L2 is now Modified (received dirty WB from L1)
+        a0_way = 2'bxx;
+        found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'h20] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'h20] != 2'b00) begin
+                found = 1;
+                a0_way = w[1:0];
+            end
+        end
+        coherency_checks++;
+        if (found && DUT.ccl0.l2.dp.mesi_array[a0_way][8'h20] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST15 step4: A0 in L2 way %0d as Modified (11) after L1 WB", a0_way);
+            coherency_passed++;
+        end else if (found) begin
+            $display("[COHERENCY FAIL] TEST15 step4: A0 in L2 way %0d, MESI=%b (expected 11=Modified)",
+                     a0_way, DUT.ccl0.l2.dp.mesi_array[a0_way][8'h20]);
+            coherency_failed++;
+            test15_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step4: A0 not found in L2 set 32 after WB!");
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        // Also verify dirty data word[0] = 0xBB000001 is in L2
+        if (found) begin
+            coherency_checks++;
+            if (DUT.ccl0.l2.dp.data_array[a0_way][8'h20][0] == 32'hBB000001) begin
+                $display("[COHERENCY PASS] TEST15 step4: A0 dirty data in L2 way %0d word[0]=%h",
+                         a0_way, DUT.ccl0.l2.dp.data_array[a0_way][8'h20][0]);
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST15 step4: A0 L2 data word[0]=%h (expected BB000001)",
+                         DUT.ccl0.l2.dp.data_array[a0_way][8'h20][0]);
+                coherency_failed++;
+                test15_passed = 0;
+            end
+        end
+
+        // ------------------------------------------------------------------
+        // Step 5: Read A3 -> fills L2 way3; L2 set 32 is now FULL (4/4 ways valid)
+        // ------------------------------------------------------------------
+        $display("[TEST15] Step 5: CPU0 reads A3=0x3200 (fills L2 way3, set now full)...");
+        cpu_read(32'h0000_3200);
+        print_l2_cache_set(8'h20);
+
+        // Verify all 4 ways are valid with the expected tags
+        begin
+            int valid_ways;
+            valid_ways = 0;
+            for (int w = 0; w < 4; w++) begin
+                if (DUT.ccl0.l2.dp.mesi_array[w][8'h20] != 2'b00) valid_ways++;
+            end
+            coherency_checks++;
+            if (valid_ways == 4) begin
+                $display("[COHERENCY PASS] TEST15 step5: All 4 L2 ways valid (set full)");
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST15 step5: Only %0d/4 ways valid (expected full set)",
+                         valid_ways);
+                coherency_failed++;
+                test15_passed = 0;
+            end
+        end
+
+        // Verify each of A0-A3's tags is present in the set
+        begin
+            logic [3:0] tag_present;
+            tag_present = 4'b0;
+            for (int w = 0; w < 4; w++) begin
+                case (DUT.ccl0.l2.dp.tag_array[w][8'h20])
+                    20'h00000: tag_present[0] = 1;
+                    20'h00001: tag_present[1] = 1;
+                    20'h00002: tag_present[2] = 1;
+                    20'h00003: tag_present[3] = 1;
+                    default:   ; // unexpected
+                endcase
+            end
+            coherency_checks++;
+            if (tag_present == 4'b1111) begin
+                $display("[COHERENCY PASS] TEST15 step5: Tags 0-3 (A0-A3) all present in L2 set 32");
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST15 step5: Tag presence mask=%b (expected 1111=A0..A3)",
+                         tag_present);
+                coherency_failed++;
+                test15_passed = 0;
+            end
+        end
+
+        // ------------------------------------------------------------------
+        // Step 6: Read A4 -> triggers LRU eviction of dirty A0 from L2 to memory
+        //         Expected: 1 write-back + 1 fill = 2 new memory transactions
+        // ------------------------------------------------------------------
+        $display("[TEST15] Step 6: CPU0 reads A4=0x4200 (5th conflict -> dirty LRU evict A0 to memory)...");
+        mc_before = mem_transaction_count;
+        wb_before = mem_wb_count;
+        cpu_read(32'h0000_4200);
+        mc_after  = mem_transaction_count;
+        wb_after  = mem_wb_count;
+        print_l2_cache_set(8'h20);
+
+        // Verify 1 write-back transaction occurred (dirty A0 evicted to memory)
+        coherency_checks++;
+        if ((wb_after - wb_before) == 1) begin
+            $display("[COHERENCY PASS] TEST15 step6: Exactly 1 write-back to memory (dirty LRU eviction confirmed)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step6: %0d write-back(s) counted, expected 1",
+                     wb_after - wb_before);
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        // Verify 2 total memory transactions: 1 WB + 1 fill
+        coherency_checks++;
+        if ((mc_after - mc_before) == 2) begin
+            $display("[COHERENCY PASS] TEST15 step6: 2 memory transactions (WB + fill), mc=%0d", mc_after);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step6: %0d memory transactions, expected 2 (WB + fill)",
+                     mc_after - mc_before);
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        // Verify A0 (tag=0) is no longer in L2 set 32
+        a0_found_after_evict = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'h20] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'h20] != 2'b00)
+                a0_found_after_evict = 1;
+        end
+        coherency_checks++;
+        if (!a0_found_after_evict) begin
+            $display("[COHERENCY PASS] TEST15 step6: A0 evicted from L2 set 32 (not present)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step6: A0 still in L2 after eviction!");
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        // Verify A4 (tag=4) is now in L2 set 32
+        a4_found_after_evict = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'h20] == 20'h00004 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'h20] != 2'b00)
+                a4_found_after_evict = 1;
+        end
+        coherency_checks++;
+        if (a4_found_after_evict) begin
+            $display("[COHERENCY PASS] TEST15 step6: A4 allocated in L2 set 32 (tag=4 found)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step6: A4 NOT found in L2 set 32 after allocation!");
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        // Verify dirty write-back data landed in memory: memory[A0_w0] should be 0xBB000001
+        // (memory model now captures writes; reference model also flushed this in step 4)
+        a0_w0_in_mem = memory[32'h0000_0200 >> 2];  // word addr 0x80
+        coherency_checks++;
+        if (a0_w0_in_mem == 32'hBB000001) begin
+            $display("[COHERENCY PASS] TEST15 step6: Memory has dirty WB data word[0]=%h", a0_w0_in_mem);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST15 step6: memory[A0_w0]=%h (expected BB000001)", a0_w0_in_mem);
+            coherency_failed++;
+            test15_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test15_passed = 0;
+        if (test15_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 16: Back-to-Back Snoops (Both CPUs Read Same Line Simultaneously)
+    // =========================================================================
+    // CPU0 and CPU1 issue reads to the same cold-miss address at the same time.
+    // The arbiter serialises the two L1 misses through the one shared L2.  The
+    // snoop controller must handle the overlapping snoop requests so that both
+    // caches end up holding the line in Shared state without data corruption.
+    //
+    //   Addr  = 0x0000_7400
+    //   L1 idx (l1a & l1b) = addr[12:4] = 0x140 = 320
+    //   L2 set              = addr[11:4] = 0x40  = 64
+    //   L2 tag              = addr[31:12]        = 7
+    //   Expected word[0]    = 0xA000_0000 + (0x7400>>4) = 0xA000_0740
+    // =========================================================================
+    $display("\n=== TEST 16: Back-to-Back Snoops (Simultaneous CPU0/CPU1 Reads) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test16_passed;
+        logic [1:0]  l1a_mesi_16, l1b_mesi_16;
+        logic [31:0] l1a_data_16, l1b_data_16;
+
+        test16_passed = 1;
+
+        $display("[TEST16] CPU0 and CPU1 simultaneously read 0x7400 (cold miss, L1 idx 320)...");
+
+        // Both tasks drive independent signals (cpu0_*/cpu1_*) so they can
+        // run concurrently.  The hardware arbitrates.
+        fork
+            cpu_read(32'h0000_7400);   // CPU0 — scoreboard checked internally
+            cpu1_read(32'h0000_7400);  // CPU1
+        join
+
+        l1a_mesi_16 = DUT.ccl0.l1a.dp.mesi_array[320];
+        l1b_mesi_16 = DUT.ccl0.l1b.dp.mesi_array[320];
+        l1a_data_16 = DUT.ccl0.l1a.dp.data_array[320][0];
+        l1b_data_16 = DUT.ccl0.l1b.dp.data_array[320][0];
+
+        // --- CPU0 data check ---
+        coherency_checks++;
+        if (l1a_data_16 == 32'hA000_0740) begin
+            $display("[COHERENCY PASS] TEST16: CPU0 L1[320] word[0]=%h (correct)", l1a_data_16);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST16: CPU0 L1[320] word[0]=%h (expected A0000740)", l1a_data_16);
+            coherency_failed++;
+            test16_passed = 0;
+        end
+
+        // --- CPU0 MESI check: must be Shared (both CPUs hold the line) ---
+        coherency_checks++;
+        if (l1a_mesi_16 == 2'b01) begin
+            $display("[COHERENCY PASS] TEST16: CPU0 L1[320] MESI=Shared (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST16: CPU0 L1[320] MESI=%b (expected 01=Shared)", l1a_mesi_16);
+            coherency_failed++;
+            test16_passed = 0;
+        end
+
+        // --- CPU1 data check ---
+        coherency_checks++;
+        if (l1b_data_16 == 32'hA000_0740) begin
+            $display("[COHERENCY PASS] TEST16: CPU1 L1[320] word[0]=%h (correct)", l1b_data_16);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST16: CPU1 L1[320] word[0]=%h (expected A0000740)", l1b_data_16);
+            coherency_failed++;
+            test16_passed = 0;
+        end
+
+        // --- CPU1 MESI check: must be Shared ---
+        coherency_checks++;
+        if (l1b_mesi_16 == 2'b01) begin
+            $display("[COHERENCY PASS] TEST16: CPU1 L1[320] MESI=Shared (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST16: CPU1 L1[320] MESI=%b (expected 01=Shared)", l1b_mesi_16);
+            coherency_failed++;
+            test16_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test16_passed = 0;
+        if (test16_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 17: Snoop During L2 Allocation (CPU1 Arrives Mid-Fetch)
+    // =========================================================================
+    // CPU0 misses and L2 begins a memory fill (ALLOC_ADDR → ALLOC_DATA).
+    // CPU1 issues a read for the SAME address 5 cycles later, when L2 is
+    // partway through its data-phase transfer.  The snoop controller must
+    // keep CPU1 waiting until the fill completes, then forward the data to
+    // both caches.  Both must receive correct data and settle as Shared.
+    //
+    //   Addr  = 0x0000_7800
+    //   L1 idx (l1a & l1b) = addr[12:4] = 0x180 = 384
+    //   L2 set              = addr[11:4] = 0x80  = 128
+    //   L2 tag              = addr[31:12]        = 7
+    //   Expected word[0]    = 0xA000_0000 + (0x7800>>4) = 0xA000_0780
+    // =========================================================================
+    $display("\n=== TEST 17: Snoop During L2 Allocation (CPU1 Requests Mid-Fetch) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test17_passed;
+        logic [1:0]  l1a_mesi_17, l1b_mesi_17;
+        logic [31:0] l1a_data_17, l1b_data_17;
+
+        test17_passed = 1;
+
+        $display("[TEST17] CPU0 misses 0x7800; CPU1 requests same line 5 cycles later (mid-fetch)...");
+
+        // CPU0 starts immediately; CPU1 starts after 5 clock edges so it
+        // arrives while L2 is in ALLOC_DATA (memory still transferring data).
+        fork
+            cpu_read(32'h0000_7800);
+            begin
+                repeat(5) @(posedge clk);
+                cpu1_read(32'h0000_7800);
+            end
+        join
+
+        l1a_mesi_17 = DUT.ccl0.l1a.dp.mesi_array[384];
+        l1b_mesi_17 = DUT.ccl0.l1b.dp.mesi_array[384];
+        l1a_data_17 = DUT.ccl0.l1a.dp.data_array[384][0];
+        l1b_data_17 = DUT.ccl0.l1b.dp.data_array[384][0];
+
+        // --- CPU0 data check ---
+        coherency_checks++;
+        if (l1a_data_17 == 32'hA000_0780) begin
+            $display("[COHERENCY PASS] TEST17: CPU0 L1[384] word[0]=%h (correct)", l1a_data_17);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST17: CPU0 L1[384] word[0]=%h (expected A0000780)", l1a_data_17);
+            coherency_failed++;
+            test17_passed = 0;
+        end
+
+        // --- CPU0 MESI check: Shared because CPU1 also holds this line ---
+        coherency_checks++;
+        if (l1a_mesi_17 == 2'b01) begin
+            $display("[COHERENCY PASS] TEST17: CPU0 L1[384] MESI=Shared (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST17: CPU0 L1[384] MESI=%b (expected 01=Shared)", l1a_mesi_17);
+            coherency_failed++;
+            test17_passed = 0;
+        end
+
+        // --- CPU1 data check ---
+        coherency_checks++;
+        if (l1b_data_17 == 32'hA000_0780) begin
+            $display("[COHERENCY PASS] TEST17: CPU1 L1[384] word[0]=%h (correct)", l1b_data_17);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST17: CPU1 L1[384] word[0]=%h (expected A0000780)", l1b_data_17);
+            coherency_failed++;
+            test17_passed = 0;
+        end
+
+        // --- CPU1 MESI check: Shared ---
+        coherency_checks++;
+        if (l1b_mesi_17 == 2'b01) begin
+            $display("[COHERENCY PASS] TEST17: CPU1 L1[384] MESI=Shared (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST17: CPU1 L1[384] MESI=%b (expected 01=Shared)", l1b_mesi_17);
+            coherency_failed++;
+            test17_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test17_passed = 0;
+        if (test17_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 18: Modified→Invalid Transition (RWITM Snoop)
+    // =========================================================================
+    // CPU0 holds a Modified line.  CPU1 issues a write (RWITM) to the same
+    // address.  The snoop controller must:
+    //   1. Force CPU0 to write back its dirty data to L2
+    //   2. Invalidate CPU0's copy
+    //   3. Forward the (now-updated) line to CPU1, which applies its write
+    //
+    //   Addr  = 0x0000_1900
+    //   L1 idx            = addr[12:4] = 0x190 = 400
+    //   L2 set            = addr[11:4] = 0x90  = 144
+    //   L2 tag            = addr[31:12]        = 1
+    //   Init word[0]      = 0xA0000190   (block 400)
+    //   CPU0 writes word[0] = 0xCAFE0018
+    //   CPU1 writes word[0] = 0xFACE0018
+    // =========================================================================
+    $display("\n=== TEST 18: Modified->Invalid Transition (RWITM Snoop) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test18_passed;
+        logic [1:0]  l1a_mesi, l1b_mesi;
+        logic [31:0] l1b_w0, l1b_w1;
+        logic [31:0] l2_w0;
+        logic [1:0]  l2_mesi;
+        logic        l2_found;
+
+        test18_passed = 1;
+
+        // Step 1: CPU0 reads 0x1900 → cold miss, Exclusive
+        $display("[TEST18] Step 1: CPU0 reads 0x1900 (cold miss -> Exclusive)...");
+        cpu_read(32'h0000_1900);
+
+        // Step 2: CPU0 writes 0x1900 → Modified
+        $display("[TEST18] Step 2: CPU0 writes 0x1900 word[0] = 0xCAFE0018...");
+        cpu_write(32'h0000_1900, 32'hCAFE0018);
+        l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[400];
+        coherency_checks++;
+        if (l1a_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST18 step2: CPU0 L1[400] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST18 step2: CPU0 L1[400] MESI=%b (expected 11)", l1a_mesi);
+            coherency_failed++;
+            test18_passed = 0;
+        end
+
+        // Step 3: CPU1 writes 0x1900 → RWITM invalidates CPU0, CPU1 gets Modified
+        $display("[TEST18] Step 3: CPU1 writes 0x1900 = 0xFACE0018 (RWITM -> invalidate CPU0)...");
+        cpu1_write(32'h0000_1900, 32'hFACE0018);
+
+        // --- Check CPU0 went Invalid ---
+        l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[400];
+        coherency_checks++;
+        if (l1a_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] TEST18 step3: CPU0 L1[400] = Invalid (00)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST18 step3: CPU0 L1[400] MESI=%b (expected 00=Invalid)", l1a_mesi);
+            coherency_failed++;
+            test18_passed = 0;
+        end
+
+        // --- Check CPU1 is Modified ---
+        l1b_mesi = DUT.ccl0.l1b.dp.mesi_array[400];
+        coherency_checks++;
+        if (l1b_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST18 step3: CPU1 L1[400] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST18 step3: CPU1 L1[400] MESI=%b (expected 11=Modified)", l1b_mesi);
+            coherency_failed++;
+            test18_passed = 0;
+        end
+
+        // --- Check CPU1 has its own write data in word[0] ---
+        l1b_w0 = DUT.ccl0.l1b.dp.data_array[400][0];
+        coherency_checks++;
+        if (l1b_w0 == 32'hFACE0018) begin
+            $display("[COHERENCY PASS] TEST18 step3: CPU1 word[0]=%h (correct)", l1b_w0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST18 step3: CPU1 word[0]=%h (expected FACE0018)", l1b_w0);
+            coherency_failed++;
+            test18_passed = 0;
+        end
+
+        // --- Check CPU1 preserved original word[1] (proves CPU0's dirty WB propagated) ---
+        l1b_w1 = DUT.ccl0.l1b.dp.data_array[400][1];
+        coherency_checks++;
+        if (l1b_w1 == 32'hB0000190) begin
+            $display("[COHERENCY PASS] TEST18 step3: CPU1 word[1]=%h (CPU0 dirty WB propagated)", l1b_w1);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST18 step3: CPU1 word[1]=%h (expected B0000190)", l1b_w1);
+            coherency_failed++;
+            test18_passed = 0;
+        end
+
+        // --- Verify L2 invalidated its copy after RWITM forward ---
+        // RWITM grants exclusive ownership to CPU1; L2 must NOT retain a
+        // valid copy (it forwarded the data then set MESI → Invalid).
+        l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd144] == 20'h00001 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd144] != 2'b00) begin
+                l2_found = 1;
+                l2_mesi = DUT.ccl0.l2.dp.mesi_array[w][8'd144];
+            end
+        end
+        coherency_checks++;
+        if (!l2_found) begin
+            $display("[COHERENCY PASS] TEST18: L2 correctly invalidated line after RWITM forward");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST18: L2 still holds 0x1900 as MESI=%b (expected Invalid after RWITM)",
+                     l2_mesi);
+            coherency_failed++;
+            test18_passed = 0;
+        end
+
+        print_cache_line(400);
+        print_cache_line_cpu1(400);
+        print_l2_cache_set(8'd144);
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test18_passed = 0;
+        if (test18_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 19: Multi-Level Write-Back (L1 → L2 → Memory)
+    // =========================================================================
+    // Verifies dirty data propagates correctly through the full hierarchy:
+    //   CPU0 write → L1 Modified → evict dirty to L2 (L2 Modified)
+    //                             → evict dirty from L2 to memory
+    //
+    // Five addresses all map to L2 set 192 (addr[11:4]=0xC0):
+    //   X  = 0x0000_0C00  L2 tag=0, L1 idx=192 — the tracked dirty line
+    //   Y  = 0x0000_2C00  L2 tag=2, L1 idx=192 — evicts X from L1
+    //   F1 = 0x0000_1C00  L2 tag=1, L1 idx=448 — fills L2 way 2
+    //   F2 = 0x0000_3C00  L2 tag=3, L1 idx=448 — fills L2 way 3
+    //   F3 = 0x0000_4C00  L2 tag=4, L1 idx=192 — evicts X from L2 to memory
+    //
+    //   CPU0 writes X word[0] = 0xDADA0019
+    //   Memory word addr for X = 0x0C00>>2 = 768
+    //   Init memory[768]       = 0xA00000C0
+    //
+    // LRU trace through L2 set 192 (4-way):
+    //   Alloc X  → way 0, lru→1
+    //   WB X     → write way 0, lru→1
+    //   Alloc Y  → way 1 (invalid), lru→2
+    //   Alloc F1 → way 2 (invalid), lru→3
+    //   Alloc F2 → way 3 (invalid), lru→0
+    //   Alloc F3 → evict way 0 (X, dirty) → WB to memory
+    // =========================================================================
+    $display("\n=== TEST 19: Multi-Level Write-Back (L1 -> L2 -> Memory) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test19_passed;
+        logic [1:0]  l2_mesi;
+        logic [31:0] l2_w0;
+        logic        l2_found;
+        logic        l2_gone;
+        int          mc_before, mc_after;
+        logic [31:0] mem_val;
+
+        test19_passed = 1;
+
+        // ------------------------------------------------------------------
+        // Step 1: Read X (cold miss into L1 and L2)
+        // ------------------------------------------------------------------
+        $display("[TEST19] Step 1: CPU0 reads X=0x0C00 (cold miss)...");
+        cpu_read(32'h0000_0C00);
+
+        // ------------------------------------------------------------------
+        // Step 2: Write X → L1 Modified, L2 still Exclusive
+        // ------------------------------------------------------------------
+        $display("[TEST19] Step 2: CPU0 writes X word[0] = 0xDADA0019...");
+        cpu_write(32'h0000_0C00, 32'hDADA0019);
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[192] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST19 step2: L1[192] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST19 step2: L1[192] MESI=%b (expected 11)",
+                     DUT.ccl0.l1a.dp.mesi_array[192]);
+            coherency_failed++;
+            test19_passed = 0;
+        end
+
+        // ------------------------------------------------------------------
+        // Step 3: Read Y → dirty X evicted from L1, WB to L2
+        //         L2 absorbs WB (X becomes Modified in L2), Y allocated
+        // ------------------------------------------------------------------
+        $display("[TEST19] Step 3: CPU0 reads Y=0x2C00 (forces dirty WB of X from L1 to L2)...");
+        cpu_read(32'h0000_2C00);
+
+        // Verify L2 has X as Modified with the dirty data
+        l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd192] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd192] != 2'b00) begin
+                l2_found = 1;
+                l2_w0   = DUT.ccl0.l2.dp.data_array[w][8'd192][0];
+                l2_mesi = DUT.ccl0.l2.dp.mesi_array[w][8'd192];
+            end
+        end
+        coherency_checks++;
+        if (l2_found && l2_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST19 step3: L2 has X as Modified (11) after L1 WB");
+            coherency_passed++;
+        end else if (!l2_found) begin
+            $display("[COHERENCY FAIL] TEST19 step3: X (tag=0) not found in L2 set 192!");
+            coherency_failed++;
+            test19_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST19 step3: L2 MESI=%b (expected 11=Modified)", l2_mesi);
+            coherency_failed++;
+            test19_passed = 0;
+        end
+
+        coherency_checks++;
+        if (l2_found && l2_w0 == 32'hDADA0019) begin
+            $display("[COHERENCY PASS] TEST19 step3: L2 dirty data word[0]=%h (L1->L2 WB correct)", l2_w0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST19 step3: L2 word[0]=%h (expected DADA0019)", l2_w0);
+            coherency_failed++;
+            test19_passed = 0;
+        end
+
+        // ------------------------------------------------------------------
+        // Steps 4-5: Fill remaining L2 ways in set 192
+        // ------------------------------------------------------------------
+        $display("[TEST19] Step 4: CPU0 reads F1=0x1C00 (fills L2 set 192 way 2)...");
+        cpu_read(32'h0000_1C00);
+
+        $display("[TEST19] Step 5: CPU0 reads F2=0x3C00 (fills L2 set 192 way 3 — set now full)...");
+        cpu_read(32'h0000_3C00);
+        print_l2_cache_set(8'd192);
+
+        // ------------------------------------------------------------------
+        // Step 6: Read F3 → L2 full, LRU evicts dirty X (way 0) to memory
+        // ------------------------------------------------------------------
+        mc_before = mem_transaction_count;
+        $display("[TEST19] Step 6: CPU0 reads F3=0x4C00 (L2 evicts dirty X to memory)...");
+        cpu_read(32'h0000_4C00);
+        mc_after = mem_transaction_count;
+
+        // Verify 2 memory transactions: 1 WB (X→mem) + 1 fill (F3←mem)
+        coherency_checks++;
+        if ((mc_after - mc_before) == 2) begin
+            $display("[COHERENCY PASS] TEST19 step6: 2 mem transactions (WB + fill)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST19 step6: %0d mem transactions (expected 2)",
+                     mc_after - mc_before);
+            coherency_failed++;
+            test19_passed = 0;
+        end
+
+        // Verify X is gone from L2 set 192
+        l2_gone = 1;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd192] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd192] != 2'b00)
+                l2_gone = 0;
+        end
+        coherency_checks++;
+        if (l2_gone) begin
+            $display("[COHERENCY PASS] TEST19 step6: X evicted from L2 set 192");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST19 step6: X (tag=0) still in L2 set 192!");
+            coherency_failed++;
+            test19_passed = 0;
+        end
+
+        // Verify dirty data reached memory (the ultimate destination)
+        mem_val = memory[32'h0000_0C00 >> 2];  // word addr 768
+        coherency_checks++;
+        if (mem_val == 32'hDADA0019) begin
+            $display("[COHERENCY PASS] TEST19 step6: memory[0x0C00]=%h (data reached memory)", mem_val);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST19 step6: memory[0x0C00]=%h (expected DADA0019)", mem_val);
+            coherency_failed++;
+            test19_passed = 0;
+        end
+
+        print_l2_cache_set(8'd192);
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test19_passed = 0;
+        if (test19_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 20: Cold Write Miss (No Prior Read — RWITM from Invalid)
+    // =========================================================================
+    // CPU0 writes to an address it has never read.  This exercises the
+    // Read-With-Intent-To-Modify (RWITM) path directly from Invalid state,
+    // bypassing the normal read→Exclusive→write→Modified sequence.
+    // The cache must allocate the line, fill it from memory, merge the write,
+    // and set MESI to Modified — all in a single transaction.
+    //
+    //   Addr     = 0x0000_0D80
+    //   L1 idx   = addr[12:4] = 0x0D8 = 216
+    //   L2 set   = addr[11:4] = 0xD8  = 216 (tag=0)
+    //   CPU0 writes word[0] = 0xC01D0020
+    //   Init word[0]        = 0xA00000D8
+    //   Init word[1]        = 0xB00000D8
+    // =========================================================================
+    $display("\n=== TEST 20: Cold Write Miss (RWITM from Invalid) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test20_passed;
+        logic [1:0]  l1_mesi;
+        logic [31:0] l1_w0, l1_w1;
+        logic        l2_found;
+        logic [1:0]  l2_mesi;
+
+        test20_passed = 1;
+
+        // Step 1: CPU0 writes 0x0D80 = 0xC01D0020 — cold write miss (RWITM)
+        // No prior read — L1[216] is Invalid, so this must allocate + fill + write
+        $display("[TEST20] Step 1: CPU0 writes 0x0D80 = 0xC01D0020 (cold write miss, RWITM from Invalid)...");
+        cpu_write(32'h0000_0D80, 32'hC01D0020);
+
+        // --- L1 must be Modified ---
+        l1_mesi = DUT.ccl0.l1a.dp.mesi_array[216];
+        coherency_checks++;
+        if (l1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST20 step1: L1[216] = Modified (11) after cold write");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST20 step1: L1[216] MESI=%b (expected 11=Modified)", l1_mesi);
+            coherency_failed++;
+            test20_passed = 0;
+        end
+
+        // --- L1 word[0] must have the written data ---
+        l1_w0 = DUT.ccl0.l1a.dp.data_array[216][0];
+        coherency_checks++;
+        if (l1_w0 == 32'hC01D0020) begin
+            $display("[COHERENCY PASS] TEST20 step1: L1[216] word[0] = %h (write merged)", l1_w0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST20 step1: L1[216] word[0] = %h (expected C01D0020)", l1_w0);
+            coherency_failed++;
+            test20_passed = 0;
+        end
+
+        // --- L1 word[1] must have original memory data (fill preserved non-written words) ---
+        l1_w1 = DUT.ccl0.l1a.dp.data_array[216][1];
+        coherency_checks++;
+        if (l1_w1 == 32'hB00000D8) begin
+            $display("[COHERENCY PASS] TEST20 step1: L1[216] word[1] = %h (memory fill preserved)", l1_w1);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST20 step1: L1[216] word[1] = %h (expected B00000D8)", l1_w1);
+            coherency_failed++;
+            test20_passed = 0;
+        end
+
+        // --- L2 must have the line allocated (inclusive policy) ---
+        l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd216] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd216] != 2'b00) begin
+                l2_found = 1;
+                l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd216];
+            end
+        end
+        coherency_checks++;
+        if (l2_found) begin
+            $display("[COHERENCY PASS] TEST20 step1: L2 set216 has line (MESI=%b) — inclusive alloc OK", l2_mesi);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST20 step1: L2 set216 tag=0 NOT found — inclusive policy violated!");
+            coherency_failed++;
+            test20_passed = 0;
+        end
+
+        print_cache_line(216);
+        print_l2_cache_set(8'd216);
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test20_passed = 0;
+        if (test20_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 21: L2 Dirty Hit on Write Miss (L2 Serves RWITM)
+    // =========================================================================
+    // CPU0 reads address A, writes it (Modified in L1), then reads B at the
+    // same L1 index to evict dirty A from L1 to L2.  L2 now holds dirty A.
+    // CPU0 then WRITES to A again — L1 miss, L2 dirty hit.  L2 must serve
+    // the dirty line back to L1 (no memory access), and L1 merges the new
+    // write, ending in Modified.  This tests the L2-serves-RWITM path (as
+    // opposed to L2-serves-read tested in Test 13).
+    //
+    //   A = 0x0000_0E00   L1 idx=224, L2 set=224, tag=0
+    //   B = 0x0000_2E00   L1 idx=224, L2 set=224, tag=2
+    //
+    //   CPU0 first write:  word[0] = 0x15100021
+    //   CPU0 second write: word[0] = 0x2AD00021
+    //   Init word[0]     = 0xA00000E0
+    //   Init word[1]     = 0xB00000E0
+    // =========================================================================
+    $display("\n=== TEST 21: L2 Dirty Hit on Write Miss (L2 Serves RWITM) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test21_passed;
+        logic [1:0]  l1_mesi;
+        logic [31:0] l1_w0, l1_w1;
+        logic        l2_found;
+        logic [31:0] l2_w0;
+        int          mc_before, mc_after;
+
+        test21_passed = 1;
+
+        // Step 1: CPU0 reads A=0x0E00 — cold miss → Exclusive
+        $display("[TEST21] Step 1: CPU0 reads A=0x0E00 (cold miss -> Exclusive)...");
+        cpu_read(32'h0000_0E00);
+
+        // Step 2: CPU0 writes A=0x0E00 word[0] = 0x15100021 — E→M
+        $display("[TEST21] Step 2: CPU0 writes A=0x0E00 = 0x15100021 (E->M)...");
+        cpu_write(32'h0000_0E00, 32'h15100021);
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[224] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST21 step2: L1[224] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST21 step2: L1[224] MESI=%b (expected 11=Modified)",
+                     DUT.ccl0.l1a.dp.mesi_array[224]);
+            coherency_failed++;
+            test21_passed = 0;
+        end
+
+        // Step 3: CPU0 reads B=0x2E00 — evicts dirty A from L1 to L2
+        $display("[TEST21] Step 3: CPU0 reads B=0x2E00 (evicts dirty A from L1 to L2)...");
+        cpu_read(32'h0000_2E00);
+
+        // Verify dirty A is in L2 set 224
+        l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd224] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd224] != 2'b00) begin
+                l2_found = 1;
+                l2_w0 = DUT.ccl0.l2.dp.data_array[w][8'd224][0];
+            end
+        end
+        coherency_checks++;
+        if (l2_found && l2_w0 == 32'h15100021) begin
+            $display("[COHERENCY PASS] TEST21 step3: Dirty A in L2 set224, word[0]=%h", l2_w0);
+            coherency_passed++;
+        end else if (!l2_found) begin
+            $display("[COHERENCY FAIL] TEST21 step3: A (tag=0) NOT found in L2 set224!");
+            coherency_failed++;
+            test21_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST21 step3: L2 word[0]=%h (expected 15100021)", l2_w0);
+            coherency_failed++;
+            test21_passed = 0;
+        end
+
+        // Step 4: CPU0 WRITES to A=0x0E00 = 0x2AD00021 — L1 miss, L2 dirty hit (no memory access)
+        $display("[TEST21] Step 4: CPU0 writes A=0x0E00 = 0x2AD00021 (L1 miss, L2 dirty hit RWITM)...");
+        mc_before = mem_transaction_count;
+        cpu_write(32'h0000_0E00, 32'h2AD00021);
+        mc_after  = mem_transaction_count;
+
+        // --- L1[224] must be Modified with the new write data ---
+        l1_mesi = DUT.ccl0.l1a.dp.mesi_array[224];
+        coherency_checks++;
+        if (l1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST21 step4: L1[224] = Modified (11) after L2 dirty hit RWITM");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST21 step4: L1[224] MESI=%b (expected 11=Modified)", l1_mesi);
+            coherency_failed++;
+            test21_passed = 0;
+        end
+
+        // --- word[0] must have the SECOND write ---
+        l1_w0 = DUT.ccl0.l1a.dp.data_array[224][0];
+        coherency_checks++;
+        if (l1_w0 == 32'h2AD00021) begin
+            $display("[COHERENCY PASS] TEST21 step4: L1[224] word[0] = %h (second write merged)", l1_w0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST21 step4: L1[224] word[0] = %h (expected 2AD00021)", l1_w0);
+            coherency_failed++;
+            test21_passed = 0;
+        end
+
+        // --- word[1] must have the original memory data (from L2 dirty fill) ---
+        l1_w1 = DUT.ccl0.l1a.dp.data_array[224][1];
+        coherency_checks++;
+        if (l1_w1 == 32'hB00000E0) begin
+            $display("[COHERENCY PASS] TEST21 step4: L1[224] word[1] = %h (L2 dirty fill preserved)", l1_w1);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST21 step4: L1[224] word[1] = %h (expected B00000E0)", l1_w1);
+            coherency_failed++;
+            test21_passed = 0;
+        end
+
+        // --- No memory access should have occurred (L2 served the dirty data) ---
+        coherency_checks++;
+        if (mc_after == mc_before) begin
+            $display("[COHERENCY PASS] TEST21 step4: No memory access (L2 dirty hit confirmed)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST21 step4: %0d memory transaction(s), expected L2 dirty hit",
+                     mc_after - mc_before);
+            coherency_failed++;
+            test21_passed = 0;
+        end
+
+        print_cache_line(224);
+        print_l2_cache_set(8'd224);
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test21_passed = 0;
+        if (test21_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 22: Cross-CCL Read-Read (Both CCLs Allocate Shared)
+    // =========================================================================
+    // CPU0 (CCL0) reads address A — cold miss, CCL0 L2 allocates Exclusive.
+    // CPU2 (CCL1) then reads the same address — CCL1 L2 misses, the L2 snoop
+    // controller detects CCL0 holds the line (l2_has_line[0]=1), issues
+    // l2_downgrade[0] to CCL0 and l2_shared_copy_exists=1 to CCL1's allocation.
+    // Both CCL L2s must end up Shared; neither L1 should be Invalid.
+    //
+    //   Addr  = 0x5500
+    //   L1 idx (both CCLs' cpu_a) = addr[12:4] & 0x1FF = 0x150 = 336
+    //   L2 set                    = addr[11:4]  & 0xFF  = 0x50  = 80 (tag=5)
+    //   Expected word[0]          = 0xA0000000 + (0x5500>>4) = 0xA0000550
+    // =========================================================================
+    $display("\n=== TEST 22: Cross-CCL Read-Read (Both CCLs Shared) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test22_passed;
+        logic [1:0]  ccl0_l2_mesi, ccl1_l2_mesi;
+        logic [1:0]  ccl0_l1_mesi, ccl1_l1_mesi;
+        logic [31:0] ccl0_l1_data, ccl1_l1_data;
+        logic        ccl0_l2_found, ccl1_l2_found;
+
+        test22_passed = 1;
+
+        // Step 1: CPU0 fills line — should be Exclusive (no other sharers yet)
+        $display("[TEST22] Step 1: CPU0 reads 0x5500 (CCL0 cold miss -> Exclusive)...");
+        cpu_read(32'h0000_5500);
+        ccl0_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd80] == 20'h00005 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd80] != 2'b00) begin
+                ccl0_l2_found  = 1;
+                ccl0_l2_mesi   = DUT.ccl0.l2.dp.mesi_array[w][8'd80];
+            end
+        end
+        coherency_checks++;
+        if (ccl0_l2_found && ccl0_l2_mesi == 2'b10) begin
+            $display("[COHERENCY PASS] TEST22 step1: CCL0 L2 set80 Exclusive (10)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST22 step1: CCL0 L2 set80 MESI=%b (expected 10=Exclusive)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test22_passed = 0;
+        end
+
+        // Step 2: CPU2 reads same address — cross-CCL snoop should downgrade CCL0 to Shared
+        $display("[TEST22] Step 2: CPU2 reads 0x5500 (CCL1 cold miss, cross-CCL snoop -> both Shared)...");
+        cpu2_read(32'h0000_5500);
+        repeat(3) @(posedge clk);  // Let snoop/downgrade settle
+
+        // Collect L2 states for both CCLs
+        ccl0_l2_found = 0; ccl1_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd80] == 20'h00005 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd80] != 2'b00) begin
+                ccl0_l2_found = 1;
+                ccl0_l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd80];
+            end
+            if (DUT.ccl1.l2.dp.tag_array[w][8'd80] == 20'h00005 &&
+                DUT.ccl1.l2.dp.mesi_array[w][8'd80] != 2'b00) begin
+                ccl1_l2_found = 1;
+                ccl1_l2_mesi  = DUT.ccl1.l2.dp.mesi_array[w][8'd80];
+            end
+        end
+        ccl0_l1_mesi = DUT.ccl0.l1a.dp.mesi_array[336];
+        ccl1_l1_mesi = DUT.ccl1.l1a.dp.mesi_array[336];
+        ccl0_l1_data = DUT.ccl0.l1a.dp.data_array[336][0];
+        ccl1_l1_data = DUT.ccl1.l1a.dp.data_array[336][0];
+
+        // --- CCL0 L2 must be Shared ---
+        coherency_checks++;
+        if (ccl0_l2_found && ccl0_l2_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST22 step2: CCL0 L2 set80 = Shared (01) after cross-CCL read");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST22 step2: CCL0 L2 set80 MESI=%b (expected 01=Shared)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test22_passed = 0;
+        end
+
+        // --- CCL1 L2 must be Shared ---
+        coherency_checks++;
+        if (ccl1_l2_found && ccl1_l2_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST22 step2: CCL1 L2 set80 = Shared (01) after cross-CCL read");
+            coherency_passed++;
+        end else if (!ccl1_l2_found) begin
+            $display("[COHERENCY FAIL] TEST22 step2: CCL1 L2 set80 tag=5 NOT found!");
+            coherency_failed++;
+            test22_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST22 step2: CCL1 L2 set80 MESI=%b (expected 01=Shared)",
+                     ccl1_l2_mesi);
+            coherency_failed++;
+            test22_passed = 0;
+        end
+
+        // --- CPU0 L1 data correct ---
+        coherency_checks++;
+        if (ccl0_l1_data == 32'hA000_0550) begin
+            $display("[COHERENCY PASS] TEST22: CPU0 L1[336] word[0]=%h (correct)", ccl0_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST22: CPU0 L1[336] word[0]=%h (expected A0000550)", ccl0_l1_data);
+            coherency_failed++;
+            test22_passed = 0;
+        end
+
+        // --- CPU2 L1 data correct ---
+        coherency_checks++;
+        if (ccl1_l1_data == 32'hA000_0550) begin
+            $display("[COHERENCY PASS] TEST22: CPU2 L1[336] word[0]=%h (correct)", ccl1_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST22: CPU2 L1[336] word[0]=%h (expected A0000550)", ccl1_l1_data);
+            coherency_failed++;
+            test22_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test22_passed = 0;
+        if (test22_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 23: Cross-CCL Read after CCL0 Exclusive
+    // =========================================================================
+    // CPU0 (CCL0) reads address B first — allocated Exclusive in CCL0 L2.
+    // CPU2 (CCL1) then reads B — L2 snoop detects CCL0 holds Exclusive,
+    // issues l2_downgrade[0].  CCL0 L2 transitions to Shared; CCL1 L2
+    // allocates as Shared (l2_shared_copy_exists=1 during fill).
+    //
+    //   Addr  = 0x5880
+    //   L1 idx                    = addr[12:4] & 0x1FF = 0x188 = 392
+    //   L2 set                    = addr[11:4]  & 0xFF  = 0x88  = 136 (tag=5)
+    //   Expected word[0]          = 0xA0000000 + 0x588  = 0xA0000588
+    // =========================================================================
+    $display("\n=== TEST 23: Cross-CCL Exclusive->Shared Downgrade ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test23_passed;
+        logic [1:0]  ccl0_l2_mesi, ccl1_l2_mesi;
+        logic [31:0] ccl0_l1_data, ccl1_l1_data;
+        logic        ccl0_l2_found, ccl1_l2_found;
+
+        test23_passed = 1;
+
+        // Step 1: CPU0 reads B — Exclusive in CCL0 (no sharers)
+        $display("[TEST23] Step 1: CPU0 reads 0x5880 (CCL0 cold miss -> Exclusive)...");
+        cpu_read(32'h0000_5880);
+        ccl0_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd136] == 20'h00005 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd136] != 2'b00) begin
+                ccl0_l2_found = 1;
+                ccl0_l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd136];
+            end
+        end
+        coherency_checks++;
+        if (ccl0_l2_found && ccl0_l2_mesi == 2'b10) begin
+            $display("[COHERENCY PASS] TEST23 step1: CCL0 L2 set136 = Exclusive (10)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST23 step1: CCL0 L2 set136 MESI=%b (expected 10)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test23_passed = 0;
+        end
+
+        // Step 2: CPU2 reads B — cross-CCL snoop downgrades CCL0, CCL1 gets Shared
+        $display("[TEST23] Step 2: CPU2 reads 0x5880 (cross-CCL snoop -> CCL0 E->S, CCL1 alloc S)...");
+        cpu2_read(32'h0000_5880);
+        repeat(3) @(posedge clk);
+
+        ccl0_l2_found = 0; ccl1_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd136] == 20'h00005 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd136] != 2'b00) begin
+                ccl0_l2_found = 1;
+                ccl0_l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd136];
+            end
+            if (DUT.ccl1.l2.dp.tag_array[w][8'd136] == 20'h00005 &&
+                DUT.ccl1.l2.dp.mesi_array[w][8'd136] != 2'b00) begin
+                ccl1_l2_found = 1;
+                ccl1_l2_mesi  = DUT.ccl1.l2.dp.mesi_array[w][8'd136];
+            end
+        end
+        ccl0_l1_data = DUT.ccl0.l1a.dp.data_array[392][0];
+        ccl1_l1_data = DUT.ccl1.l1a.dp.data_array[392][0];
+
+        // CCL0 L2 must have downgraded from Exclusive to Shared
+        coherency_checks++;
+        if (ccl0_l2_found && ccl0_l2_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST23 step2: CCL0 L2 set136 = Shared (01) — downgraded from E");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST23 step2: CCL0 L2 set136 MESI=%b (expected 01=Shared)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test23_passed = 0;
+        end
+
+        // CCL1 L2 must be Shared
+        coherency_checks++;
+        if (ccl1_l2_found && ccl1_l2_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST23 step2: CCL1 L2 set136 = Shared (01) — allocated via cross-CCL read");
+            coherency_passed++;
+        end else if (!ccl1_l2_found) begin
+            $display("[COHERENCY FAIL] TEST23 step2: CCL1 L2 set136 tag=5 NOT found!");
+            coherency_failed++;
+            test23_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST23 step2: CCL1 L2 set136 MESI=%b (expected 01=Shared)",
+                     ccl1_l2_mesi);
+            coherency_failed++;
+            test23_passed = 0;
+        end
+
+        // Both CPUs must have correct data
+        coherency_checks++;
+        if (ccl0_l1_data == 32'hA000_0588) begin
+            $display("[COHERENCY PASS] TEST23: CPU0 L1[392] word[0]=%h (correct)", ccl0_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST23: CPU0 L1[392] word[0]=%h (expected A0000588)", ccl0_l1_data);
+            coherency_failed++;
+            test23_passed = 0;
+        end
+        coherency_checks++;
+        if (ccl1_l1_data == 32'hA000_0588) begin
+            $display("[COHERENCY PASS] TEST23: CPU2 L1[392] word[0]=%h (correct)", ccl1_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST23: CPU2 L1[392] word[0]=%h (expected A0000588)", ccl1_l1_data);
+            coherency_failed++;
+            test23_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test23_passed = 0;
+        if (test23_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 24: Cross-CCL Dirty Intervention (Modified -> Writeback -> Shared)
+    // =========================================================================
+    // CPU0 (CCL0) reads then writes address C — L1a Modified, CCL0 L2 Exclusive.
+    // CPU2 (CCL1) reads C — CCL1 L2 misses, L2 snoop sees CCL0 holds dirty data
+    // (l2_writeback[0] fires).  CCL0 must write back through L2 to memory;
+    // CCL1 then fills from memory.  CPU2 must receive CPU0's modified value.
+    //
+    //   Addr     = 0x5A00
+    //   L1 idx   = addr[12:4] & 0x1FF = 0x1A0 = 416
+    //   L2 set   = addr[11:4]  & 0xFF  = 0xA0  = 160 (tag=5)
+    //   CPU0 writes word[0] = 0xCA240024
+    //   Init word[0]        = 0xA00005A0
+    // =========================================================================
+    $display("\n=== TEST 24: Cross-CCL Dirty Intervention (Modified->WB->Shared) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test24_passed;
+        logic [1:0]  ccl0_l1_mesi, ccl1_l1_mesi;
+        logic [31:0] ccl0_l1_data, ccl1_l1_data;
+        logic [31:0] mem_val;
+        logic        ccl1_l2_found;
+        logic [1:0]  ccl1_l2_mesi;
+
+        test24_passed = 1;
+
+        // Step 1: CPU0 reads C — cold miss, CCL0 Exclusive
+        $display("[TEST24] Step 1: CPU0 reads 0x5A00 (CCL0 cold miss -> Exclusive)...");
+        cpu_read(32'h0000_5A00);
+
+        // Step 2: CPU0 writes C — CCL0 L1a Modified
+        $display("[TEST24] Step 2: CPU0 writes 0x5A00 word[0] = 0xCA240024...");
+        cpu_write(32'h0000_5A00, 32'hCA240024);
+        ccl0_l1_mesi = DUT.ccl0.l1a.dp.mesi_array[416];
+        coherency_checks++;
+        if (ccl0_l1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST24 step2: CCL0 L1[416] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST24 step2: CCL0 L1[416] MESI=%b (expected 11=Modified)",
+                     ccl0_l1_mesi);
+            coherency_failed++;
+            test24_passed = 0;
+        end
+
+        // Step 3: CPU2 reads C — cross-CCL dirty intervention
+        //   CCL1 L2 misses -> L2 snoop detects CCL0 dirty -> l2_writeback[0] fires
+        //   CCL0: L1a WBs to L2, L2 WBs to memory; CCL1 fills from memory
+        //   Both should end up with the modified data (0xCA240024)
+        $display("[TEST24] Step 3: CPU2 reads 0x5A00 (cross-CCL dirty intervention)...");
+        cpu2_read(32'h0000_5A00);
+        repeat(3) @(posedge clk);
+
+        ccl0_l1_mesi = DUT.ccl0.l1a.dp.mesi_array[416];
+        ccl1_l1_mesi = DUT.ccl1.l1a.dp.mesi_array[416];
+        ccl0_l1_data = DUT.ccl0.l1a.dp.data_array[416][0];
+        ccl1_l1_data = DUT.ccl1.l1a.dp.data_array[416][0];
+
+        // CPU2 must have received the updated (dirty) data
+        coherency_checks++;
+        if (ccl1_l1_data == 32'hCA240024) begin
+            $display("[COHERENCY PASS] TEST24 step3: CPU2 L1[416] word[0]=%h (dirty data propagated cross-CCL)",
+                     ccl1_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST24 step3: CPU2 L1[416] word[0]=%h (expected CA240024)",
+                     ccl1_l1_data);
+            coherency_failed++;
+            test24_passed = 0;
+        end
+
+        // CCL0 must NOT still be Modified — it was forced to write back
+        coherency_checks++;
+        if (ccl0_l1_mesi != 2'b11) begin
+            $display("[COHERENCY PASS] TEST24 step3: CCL0 L1[416] MESI=%b (not Modified — WB completed)",
+                     ccl0_l1_mesi);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST24 step3: CCL0 L1[416] still Modified (11) — WB did not occur!");
+            coherency_failed++;
+            test24_passed = 0;
+        end
+
+        // Memory must hold the dirty value (write-back reached memory)
+        mem_val = memory[32'h0000_5A00 >> 2];
+        coherency_checks++;
+        if (mem_val == 32'hCA240024) begin
+            $display("[COHERENCY PASS] TEST24 step3: memory[0x5A00]=%h (dirty WB reached memory)", mem_val);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST24 step3: memory[0x5A00]=%h (expected CA240024)", mem_val);
+            coherency_failed++;
+            test24_passed = 0;
+        end
+
+        // CCL1 L2 must have the line
+        ccl1_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl1.l2.dp.tag_array[w][8'd160] == 20'h00005 &&
+                DUT.ccl1.l2.dp.mesi_array[w][8'd160] != 2'b00) begin
+                ccl1_l2_found = 1;
+                ccl1_l2_mesi  = DUT.ccl1.l2.dp.mesi_array[w][8'd160];
+            end
+        end
+        coherency_checks++;
+        if (ccl1_l2_found) begin
+            $display("[COHERENCY PASS] TEST24 step3: CCL1 L2 set160 has line (MESI=%b)", ccl1_l2_mesi);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST24 step3: CCL1 L2 set160 does NOT have line after cross-CCL read!");
+            coherency_failed++;
+            test24_passed = 0;
+        end
+
+        print_l2_cache_set(8'd160);
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test24_passed = 0;
+        if (test24_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 25: Multi-CCL Broadcast Invalidation
+    // =========================================================================
+    // CPU0 (CCL0) and CPU1 (CCL0) both hold Shared copies of address A.
+    // CPU2 (CCL1) writes A — cross-CCL RWITM should invalidate:
+    //   (1) CCL0 L2, (2) CCL0 L1a (CPU0), (3) CCL0 L1b (CPU1).
+    // CPU2 ends up with the only Modified copy.
+    //
+    //   Addr  = 0x6200
+    //   L1 idx = 32,  L2 set = 32,  L2 tag = 20'h00006
+    //   Init word[0] = 0xA0000620
+    //   CPU2 writes  = 0xBEEF0025
+    // =========================================================================
+    $display("\n=== TEST 25: Multi-CCL Broadcast Invalidation ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test25_passed;
+        logic [1:0]  ccl0_l2_mesi;
+        logic [1:0]  ccl0_l1a_mesi, ccl0_l1b_mesi, ccl1_l1a_mesi;
+        logic        ccl0_l2_found;
+
+        test25_passed = 1;
+
+        // Step 1: CPU0 reads 0x6200 — CCL0 cold miss → Exclusive
+        $display("[TEST25] Step 1: CPU0 reads 0x6200 (CCL0 cold miss -> Exclusive)...");
+        cpu_read(32'h0000_6200);
+
+        // Step 2: CPU1 reads 0x6200 — intra-CCL snoop → L1a E→S, L1b S
+        $display("[TEST25] Step 2: CPU1 reads 0x6200 (intra-CCL snoop -> both Shared)...");
+        cpu1_read(32'h0000_6200);
+        repeat(2) @(posedge clk);
+
+        // Verify both L1s within CCL0 are Shared
+        ccl0_l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[32];
+        ccl0_l1b_mesi = DUT.ccl0.l1b.dp.mesi_array[32];
+        coherency_checks++;
+        if (ccl0_l1a_mesi == 2'b01 && ccl0_l1b_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST25 step2: L1a MESI=%b, L1b MESI=%b (both Shared)",
+                     ccl0_l1a_mesi, ccl0_l1b_mesi);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST25 step2: L1a MESI=%b, L1b MESI=%b (expected both 01=Shared)",
+                     ccl0_l1a_mesi, ccl0_l1b_mesi);
+            coherency_failed++;
+            test25_passed = 0;
+        end
+
+        // Step 3: CPU2 writes 0x6200 — cross-CCL RWITM → invalidate all CCL0 copies
+        $display("[TEST25] Step 3: CPU2 writes 0x6200=0xBEEF0025 (cross-CCL RWITM)...");
+        cpu2_write(32'h0000_6200, 32'hBEEF0025);
+        repeat(3) @(posedge clk);
+
+        // --- CCL0 L2 must be Invalid ---
+        ccl0_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd32] == 20'h00006 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd32] != 2'b00) begin
+                ccl0_l2_found = 1;
+                ccl0_l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd32];
+            end
+        end
+        coherency_checks++;
+        if (!ccl0_l2_found) begin
+            $display("[COHERENCY PASS] TEST25 step3: CCL0 L2 set32 tag=6 = Invalid");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST25 step3: CCL0 L2 set32 tag=6 MESI=%b (expected Invalid)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test25_passed = 0;
+        end
+
+        // --- CCL0 L1a (CPU0) must be Invalid ---
+        ccl0_l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[32];
+        coherency_checks++;
+        if (ccl0_l1a_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] TEST25 step3: CPU0 L1a[32] = Invalid (back-invalidated)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST25 step3: CPU0 L1a[32] MESI=%b (expected 00=Invalid)",
+                     ccl0_l1a_mesi);
+            coherency_failed++;
+            test25_passed = 0;
+        end
+
+        // --- CCL0 L1b (CPU1) must be Invalid ---
+        ccl0_l1b_mesi = DUT.ccl0.l1b.dp.mesi_array[32];
+        coherency_checks++;
+        if (ccl0_l1b_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] TEST25 step3: CPU1 L1b[32] = Invalid (back-invalidated)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST25 step3: CPU1 L1b[32] MESI=%b (expected 00=Invalid)",
+                     ccl0_l1b_mesi);
+            coherency_failed++;
+            test25_passed = 0;
+        end
+
+        // --- CPU2 (CCL1 L1a) must be Modified with correct data ---
+        ccl1_l1a_mesi = DUT.ccl1.l1a.dp.mesi_array[32];
+        coherency_checks++;
+        if (ccl1_l1a_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST25 step3: CPU2 L1a[32] = Modified (writer)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST25 step3: CPU2 L1a[32] MESI=%b (expected 11=Modified)",
+                     ccl1_l1a_mesi);
+            coherency_failed++;
+            test25_passed = 0;
+        end
+
+        coherency_checks++;
+        if (DUT.ccl1.l1a.dp.data_array[32][0] == 32'hBEEF0025) begin
+            $display("[COHERENCY PASS] TEST25 step3: CPU2 data word[0]=%h (correct)",
+                     DUT.ccl1.l1a.dp.data_array[32][0]);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST25 step3: CPU2 data word[0]=%h (expected BEEF0025)",
+                     DUT.ccl1.l1a.dp.data_array[32][0]);
+            coherency_failed++;
+            test25_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test25_passed = 0;
+        if (test25_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 26: Cross-CCL Arbiter Race (Simultaneous Writes)
+    // =========================================================================
+    // CPU0 (CCL0) and CPU2 (CCL1) both write the same cold address on the
+    // same cycle.  The memory arbiter serialises them: the first writer
+    // allocates Modified; the second writer's RWITM invalidates the first.
+    // After both complete, exactly one CPU holds Modified.
+    //
+    //   Addr  = 0x6400
+    //   L1 idx = 64,  L2 set = 64,  L2 tag = 20'h00006
+    //   CPU0 writes = 0xAAAA0026
+    //   CPU2 writes = 0xBBBB0026
+    // =========================================================================
+    $display("\n=== TEST 26: Cross-CCL Arbiter Race ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test26_passed;
+        logic [1:0]  cpu0_l1_mesi, cpu2_l1_mesi;
+        logic [31:0] cpu0_l1_data, cpu2_l1_data;
+        logic        cpu0_won;
+
+        test26_passed = 1;
+
+        // Issue both writes on the same cycle — arbiter serialises them
+        $display("[TEST26] Issuing simultaneous writes: CPU0=0xAAAA0026, CPU2=0xBBBB0026 to 0x6400...");
+        fork
+            cpu_write(32'h0000_6400, 32'hAAAA0026);
+            cpu2_write(32'h0000_6400, 32'hBBBB0026);
+        join
+        repeat(5) @(posedge clk);
+
+        // Read final L1 states
+        cpu0_l1_mesi = DUT.ccl0.l1a.dp.mesi_array[64];
+        cpu2_l1_mesi = DUT.ccl1.l1a.dp.mesi_array[64];
+        cpu0_l1_data = DUT.ccl0.l1a.dp.data_array[64][0];
+        cpu2_l1_data = DUT.ccl1.l1a.dp.data_array[64][0];
+
+        // Determine winner (last writer holds Modified)
+        cpu0_won = (cpu0_l1_mesi == 2'b11);
+
+        // Check 1: Exactly one CPU must hold Modified
+        coherency_checks++;
+        if ((cpu0_l1_mesi == 2'b11) ^ (cpu2_l1_mesi == 2'b11)) begin
+            $display("[COHERENCY PASS] TEST26: Exactly one Modified — CPU0=%b CPU2=%b (winner: %s)",
+                     cpu0_l1_mesi, cpu2_l1_mesi, cpu0_won ? "CPU0" : "CPU2");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST26: CPU0 MESI=%b, CPU2 MESI=%b (need exactly one Modified)",
+                     cpu0_l1_mesi, cpu2_l1_mesi);
+            coherency_failed++;
+            test26_passed = 0;
+        end
+
+        // Check 2: Winner's data must match their written value
+        coherency_checks++;
+        if (cpu0_won) begin
+            if (cpu0_l1_data == 32'hAAAA0026) begin
+                $display("[COHERENCY PASS] TEST26: Winner CPU0 data=%h (correct)", cpu0_l1_data);
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST26: Winner CPU0 data=%h (expected AAAA0026)", cpu0_l1_data);
+                coherency_failed++;
+                test26_passed = 0;
+            end
+        end else begin
+            if (cpu2_l1_data == 32'hBBBB0026) begin
+                $display("[COHERENCY PASS] TEST26: Winner CPU2 data=%h (correct)", cpu2_l1_data);
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST26: Winner CPU2 data=%h (expected BBBB0026)", cpu2_l1_data);
+                coherency_failed++;
+                test26_passed = 0;
+            end
+        end
+
+        // Check 3: Loser must NOT still be Modified (no dual-Modified violation)
+        coherency_checks++;
+        if (cpu0_won) begin
+            if (cpu2_l1_mesi != 2'b11) begin
+                $display("[COHERENCY PASS] TEST26: Loser CPU2 MESI=%b (not Modified)", cpu2_l1_mesi);
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST26: Loser CPU2 still Modified!");
+                coherency_failed++;
+                test26_passed = 0;
+            end
+        end else begin
+            if (cpu0_l1_mesi != 2'b11) begin
+                $display("[COHERENCY PASS] TEST26: Loser CPU0 MESI=%b (not Modified)", cpu0_l1_mesi);
+                coherency_passed++;
+            end else begin
+                $display("[COHERENCY FAIL] TEST26: Loser CPU0 still Modified!");
+                coherency_failed++;
+                test26_passed = 0;
+            end
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test26_passed = 0;
+        if (test26_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 27: CCL-Internal Downgrade then Cross-CCL Downgrade Chain
+    // =========================================================================
+    // CPU0 (CCL0) writes address A → Modified.
+    // CPU1 (CCL0) reads A  → intra-CCL snoop forces CPU0 M→S, CPU1 gets S.
+    //   L2 receives dirty writeback — both L1s hold Shared with dirty data.
+    // CPU2 (CCL1) reads A  → cross-CCL snoop downgrades CCL0 L2, CCL1
+    //   allocates Shared.  All 3 CPUs end up Shared with CPU0's written value.
+    //
+    //   Addr  = 0x6600
+    //   L1 idx = 96,  L2 set = 96,  L2 tag = 20'h00006
+    //   Init word[0] = 0xA0000660
+    //   CPU0 writes  = 0xDEAD0027
+    // =========================================================================
+
+    $display("\n=== TEST 27: CCL-Internal then Cross-CCL Downgrade Chain ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test27_passed;
+        logic [1:0]  ccl0_l1a_mesi, ccl0_l1b_mesi, ccl1_l1a_mesi;
+        logic [31:0] ccl0_l1a_data, ccl0_l1b_data, ccl1_l1a_data;
+        logic [1:0]  ccl0_l2_mesi, ccl1_l2_mesi;
+        logic        ccl0_l2_found, ccl1_l2_found;
+
+        test27_passed = 1;
+
+        // Step 1: CPU0 reads 0x6600 — cold miss → Exclusive
+        $display("[TEST27] Step 1: CPU0 reads 0x6600 (cold miss -> Exclusive)...");
+        cpu_read(32'h0000_6600);
+
+        // Step 2: CPU0 writes 0x6600 — silent E→M upgrade (no bus transaction)
+        $display("[TEST27] Step 2: CPU0 writes 0x6600=0xDEAD0027 (E->M silent upgrade)...");
+        cpu_write(32'h0000_6600, 32'hDEAD0027);
+
+        ccl0_l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[96];
+        coherency_checks++;
+        if (ccl0_l1a_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST27 step2: CPU0 L1a[96] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step2: CPU0 L1a[96] MESI=%b (expected 11=Modified)",
+                     ccl0_l1a_mesi);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // Step 3: CPU1 reads 0x6600 — intra-CCL snoop: CPU0 M→S + dirty WB to L2
+        $display("[TEST27] Step 3: CPU1 reads 0x6600 (intra-CCL snoop: CPU0 M->S, CPU1 S)...");
+        cpu1_read(32'h0000_6600);
+        repeat(3) @(posedge clk);
+
+        ccl0_l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[96];
+        ccl0_l1b_mesi = DUT.ccl0.l1b.dp.mesi_array[96];
+        ccl0_l1a_data = DUT.ccl0.l1a.dp.data_array[96][0];
+        ccl0_l1b_data = DUT.ccl0.l1b.dp.data_array[96][0];
+
+        // CPU0 should be Shared (downgraded from Modified after WB)
+        coherency_checks++;
+        if (ccl0_l1a_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST27 step3: CPU0 L1a[96] = Shared (01) — downgraded from M");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step3: CPU0 L1a[96] MESI=%b (expected 01=Shared)",
+                     ccl0_l1a_mesi);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // CPU1 should be Shared
+        coherency_checks++;
+        if (ccl0_l1b_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST27 step3: CPU1 L1b[96] = Shared (01)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step3: CPU1 L1b[96] MESI=%b (expected 01=Shared)",
+                     ccl0_l1b_mesi);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // CPU1 must see CPU0's modified data (not stale memory data)
+        coherency_checks++;
+        if (ccl0_l1b_data == 32'hDEAD0027) begin
+            $display("[COHERENCY PASS] TEST27 step3: CPU1 word[0]=%h (dirty data forwarded)",
+                     ccl0_l1b_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step3: CPU1 word[0]=%h (expected DEAD0027)",
+                     ccl0_l1b_data);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // Step 4: CPU2 reads 0x6600 — cross-CCL snoop → all 3 Shared
+        $display("[TEST27] Step 4: CPU2 reads 0x6600 (cross-CCL snoop -> all Shared)...");
+        cpu2_read(32'h0000_6600);
+        repeat(3) @(posedge clk);
+
+        ccl1_l1a_data = DUT.ccl1.l1a.dp.data_array[96][0];
+        ccl1_l1a_mesi = DUT.ccl1.l1a.dp.mesi_array[96];
+
+        // CCL0 L2 should be Shared (downgraded)
+        ccl0_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd96] == 20'h00006 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd96] != 2'b00) begin
+                ccl0_l2_found = 1;
+                ccl0_l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd96];
+            end
+        end
+        coherency_checks++;
+        if (ccl0_l2_found && ccl0_l2_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST27 step4: CCL0 L2 set96 = Shared (01)");
+            coherency_passed++;
+        end else if (!ccl0_l2_found) begin
+            $display("[COHERENCY FAIL] TEST27 step4: CCL0 L2 set96 tag=6 NOT found!");
+            coherency_failed++;
+            test27_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step4: CCL0 L2 set96 MESI=%b (expected 01=Shared)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // CCL1 L2 should be Shared
+        ccl1_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl1.l2.dp.tag_array[w][8'd96] == 20'h00006 &&
+                DUT.ccl1.l2.dp.mesi_array[w][8'd96] != 2'b00) begin
+                ccl1_l2_found = 1;
+                ccl1_l2_mesi  = DUT.ccl1.l2.dp.mesi_array[w][8'd96];
+            end
+        end
+        coherency_checks++;
+        if (ccl1_l2_found && ccl1_l2_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST27 step4: CCL1 L2 set96 = Shared (01)");
+            coherency_passed++;
+        end else if (!ccl1_l2_found) begin
+            $display("[COHERENCY FAIL] TEST27 step4: CCL1 L2 set96 tag=6 NOT found!");
+            coherency_failed++;
+            test27_passed = 0;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step4: CCL1 L2 set96 MESI=%b (expected 01=Shared)",
+                     ccl1_l2_mesi);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // CPU2 must see CPU0's dirty data (propagated through L2 WB + cross-CCL fill)
+        coherency_checks++;
+        if (ccl1_l1a_data == 32'hDEAD0027) begin
+            $display("[COHERENCY PASS] TEST27 step4: CPU2 word[0]=%h (dirty data from CCL0)",
+                     ccl1_l1a_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step4: CPU2 word[0]=%h (expected DEAD0027)",
+                     ccl1_l1a_data);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        // All 3 L1 copies should be Shared
+        ccl0_l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[96];
+        ccl0_l1b_mesi = DUT.ccl0.l1b.dp.mesi_array[96];
+        ccl1_l1a_mesi = DUT.ccl1.l1a.dp.mesi_array[96];
+        coherency_checks++;
+        if (ccl0_l1a_mesi == 2'b01 && ccl0_l1b_mesi == 2'b01 && ccl1_l1a_mesi == 2'b01) begin
+            $display("[COHERENCY PASS] TEST27 step4: All 3 CPUs Shared — CPU0=%b CPU1=%b CPU2=%b",
+                     ccl0_l1a_mesi, ccl0_l1b_mesi, ccl1_l1a_mesi);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST27 step4: CPU0=%b CPU1=%b CPU2=%b (expected all 01=Shared)",
+                     ccl0_l1a_mesi, ccl0_l1b_mesi, ccl1_l1a_mesi);
+            coherency_failed++;
+            test27_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test27_passed = 0;
+        if (test27_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 28: Dirty L2 Eviction to Memory – Cross-CCL Read via Memory
+    // =========================================================================
+    // CPU0 writes address A0 → Modified in CCL0 L1/L2.
+    // Then CPU0 accesses 4 more addresses mapping to the same L2 set (4-way),
+    // causing L2 to evict the dirty A0 line back to memory.
+    // CPU2 (CCL1) reads A0 → must fetch from memory and see the dirty data.
+    //
+    // Addresses (all map to L2 set 200, tag differs):
+    //   A0: 0x00000C80  tag=0x00000  L1 idx=200
+    //   A1: 0x00001C80  tag=0x00001  L1 idx=456
+    //   A2: 0x00002C80  tag=0x00002  L1 idx=200
+    //   A3: 0x00003C80  tag=0x00003  L1 idx=456
+    //   A4: 0x00004C80  tag=0x00004  L1 idx=200
+    //
+    // L2 4-way round-robin: fills ways 0-3 with A0-A3, then A4 evicts way 0 (A0).
+    // A0 is Modified → dirty WB to memory.
+    // CPU0 writes 0xDEAD0028 to A0 word[0].
+    // Init word[0] of A0 = 0xA00000C8.
+    // =========================================================================
+
+    $display("\n=== TEST 28: Dirty L2 Eviction to Memory – Cross-CCL Read ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test28_passed;
+        logic [1:0]  ccl0_l2_mesi, ccl1_l1a_mesi;
+        logic        ccl0_l2_found;
+        logic [31:0] ccl1_l1a_data;
+        logic [31:0] mem_word0;
+
+        test28_passed = 1;
+
+        // Step 1: CPU0 reads A0 (0x0C80) — cold miss → Exclusive
+        $display("[TEST28] Step 1: CPU0 reads 0x0C80 (cold miss -> Exclusive)...");
+        cpu_read(32'h0000_0C80);
+
+        // Step 2: CPU0 writes A0 (0x0C80) — silent E→M upgrade
+        $display("[TEST28] Step 2: CPU0 writes 0x0C80 = 0xDEAD0028 (E->M)...");
+        cpu_write(32'h0000_0C80, 32'hDEAD0028);
+
+        // Confirm L1[200] is Modified
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[200] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST28 step2: CPU0 L1a[200] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST28 step2: CPU0 L1a[200] MESI=%b (expected 11=Modified)",
+                     DUT.ccl0.l1a.dp.mesi_array[200]);
+            coherency_failed++;
+            test28_passed = 0;
+        end
+
+        // Step 3: CPU0 reads A1 (0x1C80) — fill L2 way 1
+        $display("[TEST28] Step 3: CPU0 reads 0x1C80 (fill L2 set200 way1)...");
+        cpu_read(32'h0000_1C80);
+
+        // Step 4: CPU0 reads A2 (0x2C80) — evicts A0 from L1[200] (dirty WB to L2), fill L2 way 2
+        $display("[TEST28] Step 4: CPU0 reads 0x2C80 (L1 evicts dirty A0 to L2, fill L2 way2)...");
+        cpu_read(32'h0000_2C80);
+
+        // Step 5: CPU0 reads A3 (0x3C80) — fill L2 way 3 (all 4 ways now occupied)
+        $display("[TEST28] Step 5: CPU0 reads 0x3C80 (fill L2 set200 way3, set full)...");
+        cpu_read(32'h0000_3C80);
+
+        // Step 6: CPU0 reads A4 (0x4C80) — L2 set 200 overflow → evicts way 0 (A0, Modified) to memory
+        $display("[TEST28] Step 6: CPU0 reads 0x4C80 (L2 evicts dirty A0 to memory)...");
+        cpu_read(32'h0000_4C80);
+        repeat(5) @(posedge clk);  // Let memory WB complete
+
+        // --- Verification: A0 should be gone from CCL0 L2 ---
+        ccl0_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl0.l2.dp.tag_array[w][8'd200] == 20'h00000 &&
+                DUT.ccl0.l2.dp.mesi_array[w][8'd200] != 2'b00) begin
+                ccl0_l2_found = 1;
+                ccl0_l2_mesi  = DUT.ccl0.l2.dp.mesi_array[w][8'd200];
+            end
+        end
+        coherency_checks++;
+        if (!ccl0_l2_found) begin
+            $display("[COHERENCY PASS] TEST28 step6: A0 (tag=0) evicted from CCL0 L2 set200");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST28 step6: A0 still in CCL0 L2 set200 MESI=%b (expected evicted)",
+                     ccl0_l2_mesi);
+            coherency_failed++;
+            test28_passed = 0;
+        end
+
+        // --- Verification: Memory should have dirty data ---
+        mem_word0 = memory[32'h0000_0C80 >> 2];
+        coherency_checks++;
+        if (mem_word0 == 32'hDEAD0028) begin
+            $display("[COHERENCY PASS] TEST28 step6: memory[0x320] = %h (dirty WB reached memory)",
+                     mem_word0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST28 step6: memory[0x320] = %h (expected DEAD0028)",
+                     mem_word0);
+            coherency_failed++;
+            test28_passed = 0;
+        end
+
+        // Step 7: CPU2 reads A0 (0x0C80) — CCL1 miss → fetches from memory
+        $display("[TEST28] Step 7: CPU2 reads 0x0C80 (fetch from memory -> must see dirty data)...");
+        cpu2_read(32'h0000_0C80);
+        repeat(3) @(posedge clk);
+
+        // CPU2 L1 should have the dirty data value
+        ccl1_l1a_data = DUT.ccl1.l1a.dp.data_array[200][0];
+        ccl1_l1a_mesi = DUT.ccl1.l1a.dp.mesi_array[200];
+
+        coherency_checks++;
+        if (ccl1_l1a_data == 32'hDEAD0028) begin
+            $display("[COHERENCY PASS] TEST28 step7: CPU2 L1a[200] word[0] = %h (dirty data from memory)",
+                     ccl1_l1a_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST28 step7: CPU2 L1a[200] word[0] = %h (expected DEAD0028)",
+                     ccl1_l1a_data);
+            coherency_failed++;
+            test28_passed = 0;
+        end
+
+        // CPU2 L1 should be Exclusive (only copy, fetched from memory, no sharers)
+        coherency_checks++;
+        if (ccl1_l1a_mesi == 2'b10) begin
+            $display("[COHERENCY PASS] TEST28 step7: CPU2 L1a[200] = Exclusive (10)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST28 step7: CPU2 L1a[200] MESI=%b (expected 10=Exclusive)",
+                     ccl1_l1a_mesi);
+            coherency_failed++;
+            test28_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test28_passed = 0;
+        if (test28_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 29: Cross-CCL L2 Capacity Eviction Coherency
+    // =========================================================================
+    // CPU2 (CCL1) writes address A0 → Modified in CCL1 L1/L2.
+    // Then CPU2 accesses 4 more addresses mapping to the same L2 set (4-way),
+    // causing CCL1 L2 to evict the dirty A0 line back to memory.
+    // CPU0 (CCL0) reads A0 → must fetch from memory and see the dirty data.
+    //
+    // Addresses (all map to L2 set 201, tag differs):
+    //   A0: 0x00000C90  tag=0x00000  L1 idx=201
+    //   A1: 0x00001C90  tag=0x00001  L1 idx=457
+    //   A2: 0x00002C90  tag=0x00002  L1 idx=201
+    //   A3: 0x00003C90  tag=0x00003  L1 idx=457
+    //   A4: 0x00004C90  tag=0x00004  L1 idx=201
+    //
+    // L2 4-way round-robin: fills ways 0-3 with A0-A3, then A4 evicts way 0 (A0).
+    // A0 is Modified → dirty WB to memory.
+    // CPU2 writes 0xDEAD0029 to A0 word[0].
+    // Init word[0] of A0 = 0xA00000C9.
+    // =========================================================================
+
+    $display("\n=== TEST 29: Cross-CCL L2 Capacity Eviction Coherency ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test29_passed;
+        logic [1:0]  ccl1_l2_mesi, ccl0_l1a_mesi;
+        logic        ccl1_l2_found;
+        logic [31:0] ccl0_l1a_data;
+        logic [31:0] mem_word0;
+
+        test29_passed = 1;
+
+        // Step 1: CPU2 reads A0 (0x0C90) — cold miss → Exclusive
+        $display("[TEST29] Step 1: CPU2 reads 0x0C90 (cold miss -> Exclusive)...");
+        cpu2_read(32'h0000_0C90);
+
+        // Step 2: CPU2 writes A0 (0x0C90) — silent E→M upgrade
+        $display("[TEST29] Step 2: CPU2 writes 0x0C90 = 0xDEAD0029 (E->M)...");
+        cpu2_write(32'h0000_0C90, 32'hDEAD0029);
+
+        // Confirm CCL1 L1a[201] is Modified
+        coherency_checks++;
+        if (DUT.ccl1.l1a.dp.mesi_array[201] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST29 step2: CPU2 L1a[201] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST29 step2: CPU2 L1a[201] MESI=%b (expected 11=Modified)",
+                     DUT.ccl1.l1a.dp.mesi_array[201]);
+            coherency_failed++;
+            test29_passed = 0;
+        end
+
+        // Step 3: CPU2 reads A1 (0x1C90) — fill L2 way 1
+        $display("[TEST29] Step 3: CPU2 reads 0x1C90 (fill L2 set201 way1)...");
+        cpu2_read(32'h0000_1C90);
+
+        // Step 4: CPU2 reads A2 (0x2C90) — evicts A0 from L1[201] (dirty WB to L2), fill L2 way 2
+        $display("[TEST29] Step 4: CPU2 reads 0x2C90 (L1 evicts dirty A0 to L2, fill L2 way2)...");
+        cpu2_read(32'h0000_2C90);
+
+        // Step 5: CPU2 reads A3 (0x3C90) — fill L2 way 3 (all 4 ways now occupied)
+        $display("[TEST29] Step 5: CPU2 reads 0x3C90 (fill L2 set201 way3, set full)...");
+        cpu2_read(32'h0000_3C90);
+
+        // Step 6: CPU2 reads A4 (0x4C90) — L2 set 201 overflow → evicts way 0 (A0, Modified) to memory
+        $display("[TEST29] Step 6: CPU2 reads 0x4C90 (L2 evicts dirty A0 to memory)...");
+        cpu2_read(32'h0000_4C90);
+        repeat(5) @(posedge clk);  // Let memory WB complete
+
+        // --- Verification: A0 should be gone from CCL1 L2 ---
+        ccl1_l2_found = 0;
+        for (int w = 0; w < 4; w++) begin
+            if (DUT.ccl1.l2.dp.tag_array[w][8'd201] == 20'h00000 &&
+                DUT.ccl1.l2.dp.mesi_array[w][8'd201] != 2'b00) begin
+                ccl1_l2_found = 1;
+                ccl1_l2_mesi  = DUT.ccl1.l2.dp.mesi_array[w][8'd201];
+            end
+        end
+        coherency_checks++;
+        if (!ccl1_l2_found) begin
+            $display("[COHERENCY PASS] TEST29 step6: A0 (tag=0) evicted from CCL1 L2 set201");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST29 step6: A0 still in CCL1 L2 set201 MESI=%b (expected evicted)",
+                     ccl1_l2_mesi);
+            coherency_failed++;
+            test29_passed = 0;
+        end
+
+        // --- Verification: Memory should have dirty data ---
+        mem_word0 = memory[32'h0000_0C90 >> 2];
+        coherency_checks++;
+        if (mem_word0 == 32'hDEAD0029) begin
+            $display("[COHERENCY PASS] TEST29 step6: memory[0x324] = %h (dirty WB reached memory)",
+                     mem_word0);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST29 step6: memory[0x324] = %h (expected DEAD0029)",
+                     mem_word0);
+            coherency_failed++;
+            test29_passed = 0;
+        end
+
+        // Step 7: CPU0 reads A0 (0x0C90) — CCL0 miss → fetches from memory
+        $display("[TEST29] Step 7: CPU0 reads 0x0C90 (fetch from memory -> must see dirty data)...");
+        cpu_read(32'h0000_0C90);
+        repeat(3) @(posedge clk);
+
+        // CPU0 L1 should have the dirty data value
+        ccl0_l1a_data = DUT.ccl0.l1a.dp.data_array[201][0];
+        ccl0_l1a_mesi = DUT.ccl0.l1a.dp.mesi_array[201];
+
+        coherency_checks++;
+        if (ccl0_l1a_data == 32'hDEAD0029) begin
+            $display("[COHERENCY PASS] TEST29 step7: CPU0 L1a[201] word[0] = %h (dirty data from memory)",
+                     ccl0_l1a_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST29 step7: CPU0 L1a[201] word[0] = %h (expected DEAD0029)",
+                     ccl0_l1a_data);
+            coherency_failed++;
+            test29_passed = 0;
+        end
+
+        // CPU0 L1 should be Exclusive (only copy, fetched from memory, no sharers)
+        coherency_checks++;
+        if (ccl0_l1a_mesi == 2'b10) begin
+            $display("[COHERENCY PASS] TEST29 step7: CPU0 L1a[201] = Exclusive (10)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST29 step7: CPU0 L1a[201] MESI=%b (expected 10=Exclusive)",
+                     ccl0_l1a_mesi);
+            coherency_failed++;
+            test29_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test29_passed = 0;
+        if (test29_passed) test_passed++; else test_failed++;
+    end
+
+    // =========================================================================
+    // TEST 30: Inter-CCL Bus Saturation + MESI Cycling (Rapid Ping-Pong)
+    // =========================================================================
+    // CPU0 writes, CPU2 writes, CPU0 writes – all to the same address (0x0D00).
+    // The line bounces Modified between CCL0 and CCL1, testing:
+    //   - Cross-CCL dirty intervention on every ownership transfer
+    //   - Invalidation of the previous owner
+    //   - Correct data propagation through each hop
+    //
+    // Address: 0x00000D00
+    //   L1 index = 208, L2 index = 208, tag = 0
+    //   Init word[0] = 0xA00000D0
+    //
+    // Sequence:
+    //   1) CPU0 reads  0x0D00 → cold miss → Exclusive in CCL0
+    //   2) CPU0 writes 0x0D00 = 0xAABB0030 → E→M in CCL0
+    //   3) CPU2 writes 0x0D00 = 0xCCDD0030 → CCL1 RWITM, CCL0 dirty intervention → M in CCL1
+    //   4) CPU0 writes 0x0D00 = 0xEEFF0030 → CCL0 RWITM, CCL1 dirty intervention → M in CCL0
+    // =========================================================================
+
+    $display("\n=== TEST 30: Inter-CCL Bus Saturation + MESI Cycling (Ping-Pong) ===");
+    test_count++;
+    prev_sb_fails = data_mismatches + incorrect_predictions;
+    begin
+        logic        test30_passed;
+        logic [1:0]  ccl0_l1_mesi, ccl1_l1_mesi;
+        logic [31:0] ccl0_l1_data, ccl1_l1_data;
+
+        test30_passed = 1;
+
+        // ---- Round 1: CPU0 takes ownership ----
+
+        // Step 1: CPU0 reads 0x0D00 — cold miss → Exclusive
+        $display("[TEST30] Step 1: CPU0 reads 0x0D00 (cold miss -> Exclusive)...");
+        cpu_read(32'h0000_0D00);
+
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[208] == 2'b10) begin
+            $display("[COHERENCY PASS] TEST30 step1: CPU0 L1a[208] = Exclusive (10)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step1: CPU0 L1a[208] MESI=%b (expected 10=Exclusive)",
+                     DUT.ccl0.l1a.dp.mesi_array[208]);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        // Step 2: CPU0 writes 0x0D00 = 0xAABB0030 — silent E→M
+        $display("[TEST30] Step 2: CPU0 writes 0x0D00 = 0xAABB0030 (E->M)...");
+        cpu_write(32'h0000_0D00, 32'hAABB0030);
+
+        coherency_checks++;
+        if (DUT.ccl0.l1a.dp.mesi_array[208] == 2'b11) begin
+            $display("[COHERENCY PASS] TEST30 step2: CPU0 L1a[208] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step2: CPU0 L1a[208] MESI=%b (expected 11=Modified)",
+                     DUT.ccl0.l1a.dp.mesi_array[208]);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        // Verify data written
+        coherency_checks++;
+        ccl0_l1_data = DUT.ccl0.l1a.dp.data_array[208][0];
+        if (ccl0_l1_data == 32'hAABB0030) begin
+            $display("[COHERENCY PASS] TEST30 step2: CPU0 L1a[208] word[0] = %h", ccl0_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step2: CPU0 L1a[208] word[0] = %h (expected AABB0030)",
+                     ccl0_l1_data);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        // ---- Round 2: CPU2 steals ownership (CCL1 ← CCL0) ----
+
+        // Step 3: CPU2 writes 0x0D00 = 0xCCDD0030 — CCL1 RWITM, CCL0 dirty intervention
+        $display("[TEST30] Step 3: CPU2 writes 0x0D00 = 0xCCDD0030 (RWITM, CCL0->CCL1)...");
+        cpu2_write(32'h0000_0D00, 32'hCCDD0030);
+        repeat(3) @(posedge clk);
+
+        // CCL0 L1a[208] must be Invalid (ownership transferred)
+        ccl0_l1_mesi = DUT.ccl0.l1a.dp.mesi_array[208];
+        coherency_checks++;
+        if (ccl0_l1_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] TEST30 step3: CPU0 L1a[208] = Invalid (00) after CPU2 write");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step3: CPU0 L1a[208] MESI=%b (expected 00=Invalid)",
+                     ccl0_l1_mesi);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        // CCL1 L1a[208] must be Modified with CPU2's data
+        ccl1_l1_mesi = DUT.ccl1.l1a.dp.mesi_array[208];
+        coherency_checks++;
+        if (ccl1_l1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST30 step3: CPU2 L1a[208] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step3: CPU2 L1a[208] MESI=%b (expected 11=Modified)",
+                     ccl1_l1_mesi);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        ccl1_l1_data = DUT.ccl1.l1a.dp.data_array[208][0];
+        coherency_checks++;
+        if (ccl1_l1_data == 32'hCCDD0030) begin
+            $display("[COHERENCY PASS] TEST30 step3: CPU2 L1a[208] word[0] = %h", ccl1_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step3: CPU2 L1a[208] word[0] = %h (expected CCDD0030)",
+                     ccl1_l1_data);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        // ---- Round 3: CPU0 steals ownership back (CCL0 ← CCL1) ----
+
+        // Step 4: CPU0 writes 0x0D00 = 0xEEFF0030 — CCL0 RWITM, CCL1 dirty intervention
+        $display("[TEST30] Step 4: CPU0 writes 0x0D00 = 0xEEFF0030 (RWITM, CCL1->CCL0)...");
+        cpu_write(32'h0000_0D00, 32'hEEFF0030);
+        repeat(3) @(posedge clk);
+
+        // CCL1 L1a[208] must be Invalid (ownership transferred back)
+        ccl1_l1_mesi = DUT.ccl1.l1a.dp.mesi_array[208];
+        coherency_checks++;
+        if (ccl1_l1_mesi == 2'b00) begin
+            $display("[COHERENCY PASS] TEST30 step4: CPU2 L1a[208] = Invalid (00) after CPU0 write");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step4: CPU2 L1a[208] MESI=%b (expected 00=Invalid)",
+                     ccl1_l1_mesi);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        // CCL0 L1a[208] must be Modified with CPU0's latest data
+        ccl0_l1_mesi = DUT.ccl0.l1a.dp.mesi_array[208];
+        coherency_checks++;
+        if (ccl0_l1_mesi == 2'b11) begin
+            $display("[COHERENCY PASS] TEST30 step4: CPU0 L1a[208] = Modified (11)");
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step4: CPU0 L1a[208] MESI=%b (expected 11=Modified)",
+                     ccl0_l1_mesi);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        ccl0_l1_data = DUT.ccl0.l1a.dp.data_array[208][0];
+        coherency_checks++;
+        if (ccl0_l1_data == 32'hEEFF0030) begin
+            $display("[COHERENCY PASS] TEST30 step4: CPU0 L1a[208] word[0] = %h", ccl0_l1_data);
+            coherency_passed++;
+        end else begin
+            $display("[COHERENCY FAIL] TEST30 step4: CPU0 L1a[208] word[0] = %h (expected EEFF0030)",
+                     ccl0_l1_data);
+            coherency_failed++;
+            test30_passed = 0;
+        end
+
+        if ((data_mismatches + incorrect_predictions) > prev_sb_fails) test30_passed = 0;
+        if (test30_passed) test_passed++; else test_failed++;
+    end
+
+    $display("\n=== TEST COMPLETE ===");
+
+    
+    // Print scoreboard statistics
+    print_scoreboard();
+    
+    $finish;
+end
+
+
+endmodule
